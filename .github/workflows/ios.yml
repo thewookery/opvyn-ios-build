@@ -1,4 +1,4 @@
-﻿name: iOS unsigned build
+name: iOS unsigned build
 
 on:
   workflow_dispatch:
@@ -22,5 +22,19 @@ jobs:
         with:
           name: OPVYN-ios-unsigned
           path: OPVYN-unsigned.ipa
+          if-no-files-found: error
+
+  simulator:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and screenshot in the iOS Simulator
+        run: |
+          chmod +x ios/sim_screenshot.sh
+          ./ios/sim_screenshot.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OPVYN-simulator-shot
+          path: sim-shot.png
           if-no-files-found: error
 

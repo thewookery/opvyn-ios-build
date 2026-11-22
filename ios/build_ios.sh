@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # Build the real OPVYN JUCE panel as an iOS app (unsigned .ipa).
 # Requires macOS + Xcode 15+ (or run via .github/workflows/ios.yml).
 set -euo pipefail
@@ -23,16 +23,18 @@ APP="$(find "$BUILD" -name 'OPVYN.app' -type d | head -1)"
 echo "app: $APP"
 
 PLIST="$APP/Info.plist"
-/usr/libexec/PlistBuddy -c "Delete :UIBackgroundModes" "$PLIST" >/dev/null 2>&1 || true
-/usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST"
-/usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :UIBackgroundModes:0 audio" "$PLIST" 2>/dev/null || {
+  /usr/libexec/PlistBuddy -c "Delete :UIBackgroundModes" "$PLIST" >/dev/null 2>&1 || true
+  /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST"
+  /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST"
+}
 
 /usr/libexec/PlistBuddy -c "Delete :UISupportedInterfaceOrientations" "$PLIST" >/dev/null 2>&1 || true
 /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations array" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:0 string UIInterfaceOrientationLandscapeLeft" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:1 string UIInterfaceOrientationLandscapeRight" "$PLIST"
-/usr/libexec/PlistBuddy -c "Add :UIRequiresFullScreen bool true" "$PLIST" >/dev/null 2>&1 || true
-/usr/libexec/PlistBuddy -c "Add :UIStatusBarHidden bool true" "$PLIST" >/dev/null 2>&1 || true
+/usr/libexec/PlistBuddy -c "Set :UIRequiresFullScreen true" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :UIRequiresFullScreen bool true" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :UIStatusBarHidden true" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :UIStatusBarHidden bool true" "$PLIST"
 
 mkdir -p Payload
 cp -R "$APP" Payload/
