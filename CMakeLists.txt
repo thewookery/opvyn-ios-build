@@ -4,6 +4,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(FIELD_BUILD_PLUGIN "Build standalone and VST3" ON)
 option(FIELD_IOS "Build the iOS standalone app and AUv3" OFF)
+if(FIELD_IOS)
+  enable_language(OBJCXX)
+endif()
 option(FIELD_SANITIZER_BUILD "Use caller optimization flags for instrumented tests" OFF)
 include(CTest)
 find_package(Threads REQUIRED)
@@ -65,6 +68,8 @@ if(FIELD_BUILD_PLUGIN)
     MICROPHONE_PERMISSION_TEXT "OPVYN records your selected microphone or audio input for sampling and vocoding.")
   target_sources(FieldStudio PRIVATE Source/PluginProcessor.cpp Source/LiveCommands.cpp Source/AudioOwnership.cpp Source/ControlBridge.cpp Source/ControlApi.cpp Source/CaptureInput.cpp Source/LfoScreen.cpp Source/DimensionScreen.cpp Source/DSynthScreen.cpp Source/CwoScreen.cpp Source/DelayScreen.cpp Source/FactoryPresets.cpp Source/PresetLibrary.cpp Source/PresetBrowser.cpp Source/PluginEditor.cpp Source/PanelLegends.cpp Source/MidiMapping.cpp Source/MidiSupport.cpp Source/PresetFormat.cpp Source/PresetMapping.cpp Source/PresetParameters.cpp)
   if(FIELD_IOS)
+    # miniaudio pulls in AVFoundation's Objective-C headers on iOS.
+    set_source_files_properties(Source/CaptureInput.cpp PROPERTIES LANGUAGE OBJCXX)
     set_target_properties(FieldStudio PROPERTIES
       XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "16.0"
       XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
