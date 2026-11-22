@@ -22,6 +22,14 @@ APP="$(find "$BUILD" -name 'OPVYN.app' -type d | head -1)"
 [ -n "$APP" ] || { echo "no .app produced" >&2; exit 1; }
 echo "app: $APP"
 
+# Same plist treatment as the device build, so the simulator launches landscape.
+PLIST="$APP/Info.plist"
+/usr/libexec/PlistBuddy -c "Delete :UISupportedInterfaceOrientations" "$PLIST" >/dev/null 2>&1 || true
+/usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations array" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:0 string UIInterfaceOrientationLandscapeLeft" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:1 string UIInterfaceOrientationLandscapeRight" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :UIRequiresFullScreen true" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :UIRequiresFullScreen bool true" "$PLIST"
+
 UDID="$(xcrun simctl list devices available | grep -E '^\s+iPhone' | head -1 | grep -oE '[0-9A-F-]{36}' | head -1)"
 [ -n "$UDID" ] || { echo "no iPhone simulator found" >&2; xcrun simctl list devices available; exit 1; }
 echo "simulator: $UDID"
