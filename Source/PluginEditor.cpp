@@ -126,10 +126,7 @@ FieldEditor::FieldEditor(FieldProcessor& p):AudioProcessorEditor(p),processor(p)
     volume.setTooltip("Master volume: 1 = unity, 2 = +6 dB boost");tempo.setTooltip(juce::String::fromUTF8("Tempo · beats per minute"));steps.fill(-1);mode=processor.drumMode?1:0;processor.uiMode=mode;configureMacros();
 #if JUCE_IOS
     setResizable(false,false);
-    if (auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
-        setSize(display->userArea.getWidth(), display->userArea.getHeight());
-    else
-        setSize(1320,640);
+    setSize(1280,640);
 #else
     setResizable(true,true);setResizeLimits(1000,520,1920,1000);setSize(1320,640);
 #endif
@@ -794,6 +791,11 @@ void FieldEditor::mouseDoubleClick(const juce::MouseEvent& event){
     }
 }
 void FieldEditor::timerCallback(){
+#if JUCE_IOS
+    if (auto* p = getParentComponent())
+        if (p->getWidth() > 0 && (p->getWidth() != getWidth() || p->getHeight() != getHeight()))
+            setSize(p->getWidth(), p->getHeight());
+#endif
     if(observedSampling&&!processor.sampling&&mode==6)setMode(processor.drumMode?1:0);observedSampling=processor.sampling;
 
     const double now=juce::Time::getMillisecondCounterHiRes()*.001,elapsed=effectAnimationTime>0?now-effectAnimationTime:0;effectAnimationTime=now;
