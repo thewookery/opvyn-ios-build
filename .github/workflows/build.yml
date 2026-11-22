@@ -1,0 +1,160 @@
+name: Build and test
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            architecture: x86_64
+            cmake_args: ''
+          - os: windows-latest
+            architecture: x86_64
+            cmake_args: '-A x64'
+          - os: macos-latest
+            architecture: universal
+            cmake_args: '-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Linux prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libfreetype-dev libfontconfig1-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libgl1-mesa-dev xvfb libseccomp2 libpulse0
+          pkg-config --print-errors --exists freetype2 fontconfig
+      - name: JUCE
+        uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: ea77444750de45e036e0279bb0291144bf8e3688
+          path: vendor/JUCE
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON ${{ matrix.cmake_args }}
+      - name: Build
+        run: cmake --build build --config Release --parallel 2
+      - name: Test Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a ctest --test-dir build -C Release --output-on-failure
+      - name: Test Windows and macOS
+        if: runner.os != 'Linux'
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Install local Code Mode runtime
+        if: runner.os == 'Linux'
+        run: python -m pip install -r integrations/field-studio/requirements-code-mode.txt
+      - name: Test MCP and live control Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m unittest discover -s integrations/field-studio/tests -v
+      - name: Test MCP and live control Windows and macOS
+        if: runner.os != 'Linux'
+        run: python -m unittest discover -s integrations/field-studio/tests -v
+      - name: Verify release tag and licensing
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python -c "import os,pathlib; assert pathlib.Path('LICENSE').is_file(), 'Choose project licence before release'; assert os.environ['RELEASE_TAG']=='v'+pathlib.Path('RELEASE_VERSION').read_text().strip(), 'Tag/version mismatch'"
+      - name: Package OS downloads
+        run: python scripts/package.py --architecture ${{ matrix.architecture }}
+      - name: Package complete corresponding source
+        if: runner.os == 'Linux'
+        run: python scripts/package.py --architecture x86_64 --source
+      - name: Verify packaged downloads
+        run: python scripts/verify_packages.py dist
+      - uses: actions/upload-artifact@v4
+        if: hashFiles('LICENSE') != ''
+        with:
+          name: OPVYN-${{ runner.os }}-${{ matrix.architecture }}
+          if-no-files-found: error
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+  core-sanitizers:
+    name: Ownership core ASan and UBSan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure core ownership tests
+        run: >-
+          cmake -S . -B build-sanitize
+          -DFIELD_BUILD_PLUGIN=OFF -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_FLAGS_RELEASE="-O1 -g1 -DNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build
+        run: cmake --build build-sanitize --parallel 2
+      - name: Check core ownership and lifetime
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-sanitize --output-on-failure
+  live-sanitizers:
+    name: Live audio ownership ASan and UBSan
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libfreetype-dev libfontconfig1-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libgl1-mesa-dev xvfb
+      - uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: ea77444750de45e036e0279bb0291144bf8e3688
+          path: vendor/JUCE
+      - name: Configure live ownership tests
+        run: >-
+          cmake -S . -B build-live-sanitize -DFIELD_SANITIZER_BUILD=ON -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_FLAGS_RELEASE="-O1 -g1 -DNDEBUG -fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build live ownership tests
+        run: cmake --build build-live-sanitize --target field_ownership_tests --parallel 2
+      - name: Check live ownership and lifetime
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: xvfb-run -a ctest --test-dir build-live-sanitize -R '^audio_ownership$' --output-on-failure
+  release:
+    name: Publish tested downloads
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, core-sanitizers, live-sanitizers]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: OPVYN-*
+          path: release-downloads
+          merge-multiple: true
+      - name: Verify all target downloads
+        run: python scripts/verify_packages.py release-downloads --all-platforms
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=false
+          case "$RELEASE_TAG" in *-*) prerelease=true ;; esac
+          if gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' > /tmp/field-release-draft.txt; then
+            if [ "$(cat /tmp/field-release-draft.txt)" != "true" ]; then
+              echo "Refusing to overwrite an already published release."
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" release-downloads/*.zip release-downloads/*.sha256 --clobber
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease="$prerelease" --title "OPVYN $RELEASE_TAG" --notes-file docs/RELEASE_NOTES.md
+          else
+            gh release create "$RELEASE_TAG" release-downloads/*.zip release-downloads/*.sha256 --verify-tag --prerelease="$prerelease" --title "OPVYN $RELEASE_TAG" --notes-file docs/RELEASE_NOTES.md
+          fi

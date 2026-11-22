@@ -1,0 +1,25 @@
+name: iOS unsigned build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Source/**"
+      - "CMakeLists.txt"
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build iOS app
+        run: |
+          chmod +x ios/build_ios.sh
+          ./ios/build_ios.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OPVYN-ios-unsigned
+          path: OPVYN-unsigned.ipa
+          if-no-files-found: error

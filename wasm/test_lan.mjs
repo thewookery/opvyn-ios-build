@@ -1,0 +1,14 @@
+﻿import puppeteer from 'puppeteer-core';
+const browser = await puppeteer.launch({ executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: 'new', args: ['--autoplay-policy=no-user-gesture-required','--mute-audio'] });
+const page = await browser.newPage();
+const errs=[]; page.on('pageerror',e=>errs.push(e.message)); page.on('console',m=>{if(m.type()==='error')errs.push(m.text())});
+await page.setViewport({width:390,height:844,deviceScaleFactor:3,isMobile:true,hasTouch:true});
+await page.goto('http://192.168.0.43:8790/', {waitUntil:'networkidle0'});
+await page.click('#start');
+await page.waitForFunction(()=>document.querySelector('#status').textContent.includes('Hz'),{timeout:20000});
+await page.evaluate(async()=>{const o=window.__opvyn;o.post({type:'engine',value:2});o.post({type:'noteOn',note:60});o.post({type:'noteOn',note:67});});
+await new Promise(r=>setTimeout(r,700));
+const peak=await page.evaluate(()=>{const a=window.__opvyn.analyser,b=new Float32Array(a.fftSize);a.getFloatTimeDomainData(b);let p=0;for(const v of b)p=Math.max(p,Math.abs(v));return +p.toFixed(3)});
+await page.screenshot({path:'C:/Users/BigBoof/.gemini/antigravity/scratch/opvyn/wasm/shots/lan-final.png'});
+console.log(JSON.stringify({peak,status:await page.$eval('#status',e=>e.textContent),errs}));
+await browser.close();

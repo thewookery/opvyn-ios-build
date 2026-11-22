@@ -1,0 +1,1058 @@
+#include "Engine.h"
+#include "LfoControls.h"
+#include "DelayControls.h"
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <numeric>
+#include <stdexcept>
+
+namespace field {
+namespace {
+constexpr double pi = 3.14159265358979323846;
+constexpr double tau = pi * 2.0;
+// The DNA cell hash depends only on the integer cell and original MIDI note.
+// Build once off the audio thread; preserve the original float rounding exactly.
+const auto dnaCells=[] {std::array<std::array<float,64>,128> table{};for(int note=0;note<128;++note)for(int cell=0;cell<64;++cell){const float hash=static_cast<float>(std::sin(cell*12.9898+note*78.233)*43758.5453);table[(size_t)note][(size_t)cell]=(hash-std::floor(hash))*2-1;}return table;}();
+
+// Software physical keyboard starts at F3. Hardware's absolute drum octave is
+// not verified; this mapping keeps its leftmost displayed key on pad one.
+constexpr int drumBaseNote = 53;
+int drumPadIndex(int note) { return ((note-drumBaseNote)%24+24)%24; }
+float clamp(float x, float a = 0, float b = 1) { return std::clamp(std::isfinite(x) ? x : a, a, b); }
+double wrap(double x) { return x - std::floor(x); }
+float noise(uint32_t& state) {
+    state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+    return static_cast<float>((state & 0xffffffu) / 8388607.5 - 1.0);
+}
+float blep(double phase, double dt) {
+    if (phase < dt) { double t = phase / dt; return static_cast<float>(t + t - t*t - 1.0); }
+    if (phase > 1.0 - dt) { double t = (phase - 1.0) / dt; return static_cast<float>(t*t + t + t + 1.0); }
+    return 0;
+}
+float saw(double phase, double dt) { return static_cast<float>(phase*2.0-1.0) - blep(phase,dt); }
+float pulse(double phase, double dt, double width) {
+    return (phase < width ? 1.0f : -1.0f) + blep(phase,dt) - blep(wrap(phase-width),dt);
+}
+float sine(double phase) { return static_cast<float>(std::sin(tau*phase)); }
+float interpolate(const std::vector<float>& data, double at) {
+    if (data.empty() || at < 0 || at >= static_cast<double>(data.size())) return 0;
+    const auto index = static_cast<size_t>(at);
+    const auto next = std::min(index+1,data.size()-1);
+    const float frac = static_cast<float>(at-static_cast<double>(index));
+    return data[index] + frac * (data[next]-data[index]);
+}
+size_t snapshotBytes(const Track& t) { return t.audio.size()*2*sizeof(float); }
+}
+
+Engine::Engine() {
+    resetDrumPads();resetDboxPads();steps.fill(-1);stepVelocity.fill(.8f);
+    constexpr int initial[16]={60,-1,67,-1,63,-1,70,67,60,-1,75,-1,70,67,63,-1};
+    constexpr float accents[16]={.9f,.7f,.7f,.7f,.8f,.7f,.7f,.7f,.9f,.7f,.7f,.7f,.8f,.7f,.7f,.7f};
+    std::copy(std::begin(initial),std::end(initial),steps.begin());std::copy(std::begin(accents),std::end(accents),stepVelocity.begin());
+    for(size_t b=0;b<fingerBanks.size();++b){auto& bank=fingerBanks[b];bank.note.fill(-1);bank.velocity.fill(.8f);for(int i=0;i<16;++i)if(initial[i]>=0)bank.note[i]=std::clamp(initial[i]+static_cast<int>(b)%5,0,127);}
+    for(int i=0;i<999;++i)if(steps[(size_t)i]>=0)stepChords[(size_t)i].set((size_t)steps[(size_t)i]);for(auto& bank:fingerBanks)for(int i=0;i<32;++i)if(bank.note[(size_t)i]>=0)bank.chords[(size_t)i].set((size_t)bank.note[(size_t)i]);
+    for(size_t i=0;i<sketch.size();++i){const float x=static_cast<float>(i)/static_cast<float>(sketch.size()-1);sketch[i]={x,.5f-.25f*sine(x)};}
+    for(int i=0;i<sketchCount;++i){const float x=static_cast<float>(i)/(sketchCount-1);sketch[static_cast<size_t>(i)]={x,.5f-.25f*sine(x)};}
+}
+const DrumPad& Engine::drumPad(int index) const { return pads[static_cast<size_t>(std::clamp(index,0,23))]; }
+void Engine::setDrumPad(int index,const DrumPad& source) {
+    if(index<0 || index>=24)return;
+    auto p=source;p.start=clamp(p.start);p.end=clamp(p.end,p.start,1);
+    p.tune=clamp(p.tune,-24,24);p.level=clamp(p.level,0,2);p.pan=clamp(p.pan,-1,1);
+    p.mode=std::clamp(p.mode,0,2);p.chokeGroup=std::clamp(p.chokeGroup,0,4);
+    pads[static_cast<size_t>(index)]=p;
+}
+void Engine::resetDrumPads() {
+    for(size_t i=0;i<pads.size();++i){pads[i]=DrumPad{};pads[i].start=static_cast<float>(i)/24;pads[i].end=static_cast<float>(i+1)/24;}
+}
+const DBoxPad& Engine::dboxPad(int index) const { return dboxPads[static_cast<size_t>(std::clamp(index,0,23))]; }
+void Engine::setDboxPad(int index,const DBoxPad& source) {
+    if(index<0 || index>=24)return;
+    auto p=source;p.mix=clamp(p.mix);p.wave1=clamp(p.wave1);p.envelope1=clamp(p.envelope1,.005f,4);p.crossMod=clamp(p.crossMod);
+    p.frequency=clamp(p.frequency);p.wave2=clamp(p.wave2);p.envelope2=clamp(p.envelope2,.005f,4);p.cutoff=clamp(p.cutoff);
+    p.attack=clamp(p.attack,.0002f,1);p.gain=clamp(p.gain,0,2);p.release=clamp(p.release,.005f,4);p.smooth=clamp(p.smooth);
+    dboxPads[static_cast<size_t>(index)]=p;
+}
+void Engine::resetDboxPads(){
+    for(size_t i=0;i<dboxPads.size();++i){
+        auto p=DBoxPad{};const int kind=static_cast<int>(i)%12;
+        if(kind==0 || kind==1 || kind==7){p.frequency=.13f+kind*.005f;p.mix=.08f;p.wave2=.1f;p.envelope1=.24f;p.envelope2=.035f;p.crossMod=.04f;p.cutoff=.4f;}
+        else if(kind==2 || kind==3 || kind==5){p.frequency=.38f;p.wave1=.15f;p.mix=.65f;p.wave2=1;p.envelope1=.12f;p.envelope2=.11f;p.crossMod=.15f;p.cutoff=.8f;}
+        else{p.frequency=.68f+kind*.008f;p.mix=.8f;p.wave1=.8f;p.wave2=.95f;p.envelope1=.025f;p.envelope2=kind==6?.25f:.055f;p.cutoff=.95f;p.crossMod=.35f;}
+        if(i>=12){p.frequency=clamp(p.frequency+.055f);p.envelope1*=1.25f;}
+        dboxPads[i]=p;
+    }
+}
+void Engine::setSelectedPad(int index){padSelected=std::clamp(index,0,23);}
+void Engine::prepare(double rate, int /* maxBlock */) {
+    effectToneKey=-1;
+    metronomeBeat=0;
+    clearSequenceGates();
+    const double nextSr = std::clamp(std::isfinite(rate)?rate:44100.0, 8000.0, 192000.0);
+    if (nextSr != sr) {
+        const double ratio = nextSr / sr;
+        for (auto& t : tape) {
+            t.audio.resample(ratio,static_cast<size_t>(360.0*nextSr));
+        }
+        position *= ratio; loopBegin *= ratio; loopFinish *= ratio;
+        retireHistory(undos);retireHistory(redos);
+    }
+    sr = nextSr;lfoEnvelopeAge=0;
+    delayL.assign(static_cast<size_t>(sr*2.1)+1,0);
+    delayR.assign(delayL.size(),0);
+    delayWrite=0; fxLowL=fxLowR=fxBandL=fxBandR=wetLowL=wetLowR=0;
+    phaserL.fill(0); phaserR.fill(0);
+    motherGateRemaining=0;cwoShifter.prepare(sr);plainDelayColor.reset();cwoDelay=plainDelay=-1;cwoDelaySmoothing=1-std::exp(-1/(.005*sr));
+    for (auto& v : voices) {v.active=false;releaseVoiceSample(v);}keyCount=0;
+    isRecording=false; isPlaying=false;countInRemaining=0;countInElapsed=0;reverseHeld=false;brakeHeld=false;rollHeld=false;
+    sequenceFinished=false;seqTicks=0;seqBounce=1;seqPhase=0; seqStep=-1;seqPositionPending=-1; seqLastNote=-1;
+    peakValue=0;
+    configureVocoder();
+}
+void Engine::configureVocoder(){
+ vocoderCount=4+(int)std::round(std::clamp(params.macro[2],0.f,1.f)*12);
+ for(size_t i=0;i<vocoder.size();++i){const double frequency=100*std::pow(std::min(sr*.4,8000.)/100.,(double)i/std::max(1,vocoderCount-1));const double omega=tau*std::min(sr*.42,frequency)/sr,alpha=std::sin(omega)/(2*3.5),a0=1+alpha;vocoder[i]={};vocoder[i].b0=(float)(alpha/a0);vocoder[i].b2=-vocoder[i].b0;vocoder[i].a1=(float)(-2*std::cos(omega)/a0);vocoder[i].a2=(float)((1-alpha)/a0);}
+ for(auto& v:voices){v.vocL1.fill(0);v.vocL2.fill(0);v.vocR1.fill(0);v.vocR2.fill(0);}
+}
+void Engine::setParameters(const Parameters& p) {
+    const bool modeChanged=params.voiceMode!=p.voiceMode;const bool sequenceWasOn=params.sequenceOn;
+    const bool drumChanged=params.drumMode!=p.drumMode;
+    const bool sequencerChanged=params.sequencer!=p.sequencer;
+    params=p;
+    params.engine=std::clamp(params.engine,0,14);params.voiceMode=std::clamp(params.voiceMode,0,3);params.glideTime=clamp(params.glideTime,0,4);params.patchGain=clamp(params.patchGain,0,1);
+    for (float& m : params.macro) m=clamp(m);
+    for (float& m : params.effectMacro) m=clamp(m);
+    for (float& m : params.sequencerMacro) m=clamp(m);
+    params.lfoTarget=std::clamp(params.lfoTarget,0,19);
+    params.lfoWaveform=std::clamp(params.lfoWaveform,0,5);
+    params.lfoEnvelope=clamp(params.lfoEnvelope,-1,1);params.lfoPitchAmount=clamp(params.lfoPitchAmount,-1,1);params.lfoVolumeAmount=clamp(params.lfoVolumeAmount,-1,1);params.lfoVelocityVolume=clamp(params.lfoVelocityVolume);
+    params.lfoDivision=std::clamp(params.lfoDivision,0,11);
+    params.elementSource=std::clamp(params.elementSource,0,3);
+    params.elementManual=clamp(params.elementManual);
+    params.envelopeCurve=std::clamp(params.envelopeCurve,0,1);
+    for(size_t i=0;i<4;++i){params.midiLfoTargets[i]=std::clamp(params.midiLfoTargets[i],0,19);params.midiLfoDepth[i]=clamp(params.midiLfoDepth[i],-1,1);}
+
+    params.seqSwing=clamp(params.seqSwing,0,.5f);params.seqGate=clamp(params.seqGate,.05f,1);
+    params.attack=clamp(params.attack,.001f,10); params.decay=clamp(params.decay,.005f,10);
+    params.sustain=clamp(params.sustain); params.release=clamp(params.release,.005f,20);
+    params.effect=std::clamp(params.effect,0,10); params.effectMix=clamp(params.effectMix);
+    params.volume=clamp(params.volume,0,2.f); params.tempo=clamp(params.tempo,30,300);
+    params.lfoRate=clamp(params.lfoRate,.01f,30); params.lfoDepth=clamp(params.lfoDepth);
+    params.seqDivision=std::clamp(params.seqDivision,0,8);params.seqTriggerPattern=std::clamp(params.seqTriggerPattern,0,7);params.seqDirection=std::clamp(params.seqDirection,0,3);params.seqRotate=std::clamp(params.seqRotate,-998,998);params.seqPlayMode=std::clamp(params.seqPlayMode,0,2);params.seqTranspose=std::clamp(params.seqTranspose,-24,24);params.arpTriggerMode=std::clamp(params.arpTriggerMode,0,2);params.holdBreak=std::clamp(params.holdBreak,0,127);
+    params.tapeSpeed=clamp(params.tapeSpeed,-4,4);
+    if(params.engine==12&&4+(int)std::round(clamp(params.macro[2])*12)!=vocoderCount)configureVocoder();
+    params.metronomeLevel=clamp(params.metronomeLevel);params.metronomeSound=std::clamp(params.metronomeSound,0,2);
+    params.tapeRecordLevel=clamp(params.tapeRecordLevel,0,2);params.tapeRecordPan=clamp(params.tapeRecordPan,-1,1);
+    params.sampleRootNote=clamp(params.sampleRootNote,0,127);params.sampleStart=clamp(params.sampleStart);params.sampleEnd=clamp(params.sampleEnd,params.sampleStart,1);
+    params.sampleFineTune=clamp(params.sampleFineTune,-1,1);params.sampleLoopFade=clamp(params.sampleLoopFade);params.sampleGain=clamp(params.sampleGain,0,2);
+    params.sampleLoopIn=clamp(params.sampleLoopIn,params.sampleStart,params.sampleEnd);
+    params.sampleLoopOut=clamp(params.sampleLoopOut,params.sampleLoopIn,params.sampleEnd);
+    if (sequenceWasOn!=params.sequenceOn || drumChanged || sequencerChanged || modeChanged) {
+        for (auto& v : voices) if (v.active) { v.gate=false; v.stage=3; v.releaseStart=v.env;v.envelopeProgress=0; }
+        sequenceFinished=false;seqTicks=0;seqBounce=1;keyCount=0;heldCount=0; seqStep=-1;seqPositionPending=-1; seqPhase=0; seqLastNote=-1;clearSequenceGates();
+    }
+}
+int Engine::activeVoiceCount()const {return static_cast<int>(std::count_if(voices.begin(),voices.end(),[](const Voice& v){return v.active;}));}
+float Engine::currentVoicePitch()const {for(const auto& v:voices)if(v.active)return v.pitch;return -1;}
+void Engine::trigger(int note,float velocity){
+    if(!params.drumMode&&params.engine!=14&&(params.voiceMode==1||params.voiceMode==2)){
+        auto& old=voices[0];const bool held=old.active&&old.gate;const float pitch=old.active?old.pitch:(float)note;
+        if(params.voiceMode==2&&held&&!(old.engine==11&&old.sampleAsset!=currentSample)){old.note=std::clamp(note,0,127);old.velocity=clamp(velocity);old.detune=0;if(params.glideTime<=0)old.pitch=(float)old.note;return;}
+        for(auto& v:voices){v.active=false;releaseVoiceSample(v);}triggerVoice(note,velocity);if(params.glideTime>0&&held)voices[0].pitch=pitch;return;
+    }
+    if(!params.drumMode&&params.engine!=14&&params.voiceMode==3){for(float detune:{-.12f,-.04f,.04f,.12f})triggerVoice(note,velocity*.4f,detune);return;}
+    triggerVoice(note,velocity);
+}
+void Engine::triggerVoice(int note,float velocity,float detune) {
+    note=std::clamp(note,0,127);
+    const int padIndex=drumPadIndex(note);
+    if(params.drumMode && params.engine==11){
+        padSelected=padIndex;const auto& pad=pads[static_cast<size_t>(padIndex)];
+        for(auto& existing:voices)if(existing.active && existing.drum && existing.engine==11 &&
+            (existing.pad==padIndex || (pad.chokeGroup>0 && existing.chokeGroup==pad.chokeGroup))){
+            existing.gate=false;existing.stage=3;existing.releaseStart=existing.env;existing.envelopeProgress=0;
+            // Three-millisecond microfade avoids discontinuities when a pad
+            // retriggers or another pad in its choke group takes over.
+            existing.forcedRelease=.003f;
+        }
+    }
+    auto* voice=&voices[0];
+    for (auto& v : voices) {
+        if (!v.active) { voice=&v; break; }
+        if (v.env<voice->env || (v.env==voice->env && v.age>voice->age)) voice=&v;
+    }
+    Voice& v=*voice;releaseVoiceSample(v);v.frequencyKey=1e30f;v.filterKey=-1;v.sampleStepKey=1e30;
+    v.active=true; v.gate=true; v.note=note;v.pitch=note+detune+(params.sequenceOn&&params.sequencer==4?params.seqTranspose:0);v.detune=detune;v.stringPrevious=0; v.velocity=clamp(velocity);
+    lfoEnvelopeAge=0;v.stage=0; v.env=0;v.envelopeProgress=0;if(params.lfoRetrigger){lfoPhase=0;lfoClock=0;}v.forcedRelease=0; v.phase=0; v.phase2=.173; v.age=0; v.samplePos=0;
+    v.lp=v.hp=0; v.vocL1.fill(0);v.vocL2.fill(0);v.vocR1.fill(0);v.vocR2.fill(0);v.engine=params.engine; v.drum=params.drumMode || params.engine==14;
+    v.noise=0x9e3779b9u ^ (static_cast<uint32_t>(note)*1664525u + ++randomState);
+    if (!v.noise) v.noise=1;
+    const double frequency=440.0*std::pow(2.0,(note-69)/12.0);
+    v.stringLength=std::clamp(static_cast<int>(sr/frequency),2,4096);
+    v.stringPos=0;
+    if (v.engine==6) {
+        const int type=std::min(3,(int)(params.macro[3]*4));float previous=0;
+        for(int j=0;j<4096;++j){float n=noise(v.noise);previous+=.2f*(n-previous);v.string[(size_t)j]=type==0?n*.8f:type==1?previous*1.6f:type==2?(j<v.stringLength/4?n*.8f:0):std::sin(j*tau/std::max(2,v.stringLength))*.5f+n*.15f;}v.stringPrevious=0;
+    }
+    if(v.engine==14){
+        padSelected=padIndex;v.pad=padIndex;v.dbox=dboxPads[static_cast<size_t>(padIndex)];
+        v.dboxLowL=v.dboxBandL=v.dboxLowR=v.dboxBandR=v.dboxPrevious=0;v.dboxControlCountdown=0;v.dboxLastCutoff=v.dbox.cutoff;
+        const double cutoff=std::min(sr*.4,80.0+v.dbox.cutoff*v.dbox.cutoff*16000.0);
+        const double omega=tau*cutoff/sr,alpha=std::sin(omega)/(2*(.55+v.dbox.crossMod*3)),a0=1+alpha;
+        v.dboxFilter={static_cast<float>((1-std::cos(omega))*.5/a0),static_cast<float>((1-std::cos(omega))/a0),static_cast<float>((1-std::cos(omega))*.5/a0),static_cast<float>(-2*std::cos(omega)/a0),static_cast<float>((1-alpha)/a0)};
+    }
+    if (v.engine==11 && currentSample && !currentSample->left.empty()) {
+        v.sampleAsset=static_cast<const PreparedSample*>(currentSample);v.sampleAsset->references.fetch_add(1,std::memory_order_relaxed);
+        const auto& sampleL=v.sampleAsset->left;
+        v.sampleTune=0;v.sampleLevel=1;v.samplePan=0;v.sampleRootNote=params.sampleRootNote;v.pad=-1;v.chokeGroup=0;
+        if(v.drum){
+            const auto& pad=pads[static_cast<size_t>(padIndex)];
+            v.pad=padIndex;v.chokeGroup=pad.chokeGroup;
+            v.sampleBegin=sampleL.size()*pad.start;v.sampleFinish=sampleL.size()*pad.end;
+            v.sampleLoopBegin=v.sampleBegin;v.sampleLoopFinish=v.sampleFinish;
+            v.sampleReverse=pad.reverse;v.sampleLooped=pad.mode==2;v.sampleOneShot=pad.mode==0;
+            v.sampleTune=pad.tune;v.sampleLevel=pad.level;v.samplePan=pad.pan;
+        }else{
+            v.sampleBegin=sampleL.size()*params.sampleStart;v.sampleFinish=sampleL.size()*params.sampleEnd;
+            v.sampleLoopBegin=sampleL.size()*params.sampleLoopIn;v.sampleLoopFinish=sampleL.size()*params.sampleLoopOut;
+            v.sampleReverse=params.sampleReverse;v.sampleLooped=params.sampleLoop;v.sampleOneShot=params.sampleOneShot;
+        }
+        if(v.sampleFinish-v.sampleBegin<1){v.active=false;releaseVoiceSample(v);return;}
+        v.samplePos=v.sampleReverse?std::max(v.sampleBegin,v.sampleFinish-1):v.sampleBegin;
+    }
+}
+void Engine::noteOn(int note,float velocity) {
+    if(params.lfoRetrigger&&velocity>0){lfoPhase=0;lfoClock=0;}
+    if (velocity<=0) { noteOff(note); return; }
+    note=std::clamp(note,0,127);
+    if(!params.sequenceOn&&!params.drumMode&&params.engine!=14){for(int i=0;i<keyCount;++i)if(keyStack[(size_t)i]==note){for(int j=i;j<keyCount-1;++j)keyStack[(size_t)j]=keyStack[(size_t)j+1];--keyCount;break;}if(keyCount<128)keyStack[(size_t)keyCount++]=note;keyVelocity[(size_t)note]=clamp(velocity);}
+    if (params.sequenceOn && params.sequencer>0) {
+        if(params.sequencer==4&&note<params.holdBreak){trigger(note,velocity);return;}
+        if(params.sequencer==4&&params.holdMono){for(int i=0;i<heldCount;++i)releaseNote(heldNotes[i]);heldCount=0;}
+        if(sequenceFinished||(params.sequencer==1&&params.arpTriggerMode==1)){seqStep=-1;seqTicks=0;sequenceFinished=false;seqPhase=0;}
+        for (int j=0;j<heldCount;++j) if (heldNotes[j]==note) { heldVelocities[j]=velocity;if(seqStep<0&&params.sequencer!=4&&params.sequencer!=7){seqPhase=0;tickSequence();} return; }
+        if(params.sequencer==3)fingerSelected=((note-drumBaseNote)%16+16)%16;
+        if (heldCount<static_cast<int>(heldNotes.size())) {
+            heldNotes[heldCount]=note; heldVelocities[heldCount]=clamp(velocity); ++heldCount;
+        }
+        if(params.sequencer==4){trigger(note,velocity);if(seqStep<0)seqStep=0;}
+        else if(params.sequencer==7){addBall(note,velocity);}
+        else if (seqStep<0) { seqPhase=0; tickSequence(); }
+    } else trigger(note,velocity);
+    heldLfo=clamp(velocity);
+}
+void Engine::releaseNote(int note) {
+    for (auto& v : voices) if (v.active && v.note==note && v.gate) {
+        if (v.drum && v.engine!=11) continue;
+        if (v.engine==11 && v.sampleOneShot) continue;
+        v.gate=false; v.stage=3; v.releaseStart=v.env;v.envelopeProgress=0;
+    }
+}
+void Engine::noteOff(int note) {
+    if(!params.sequenceOn&&!params.drumMode&&params.engine!=14){for(int i=0;i<keyCount;++i)if(keyStack[(size_t)i]==note){for(int j=i;j<keyCount-1;++j)keyStack[(size_t)j]=keyStack[(size_t)j+1];--keyCount;break;}if((params.voiceMode==1||params.voiceMode==2)&&voices[0].active&&voices[0].note==note&&keyCount>0){int fallback=keyStack[(size_t)keyCount-1];trigger(fallback,keyVelocity[(size_t)fallback]);return;}}
+
+    if(params.sequenceOn&&params.sequencer==4&&note<params.holdBreak){releaseNote(note);return;}
+    if (params.sequenceOn && ((params.sequencer==4&&params.holdLatch) || params.seqHold)) return;
+    if(params.sequencer==7)for(auto& ball:balls)if(ball.note==note)ball.active=false;
+    releaseNote(note);
+    for (int j=0;j<heldCount;++j) if (heldNotes[j]==note) {
+        for (int k=j;k<heldCount-1;++k) { heldNotes[k]=heldNotes[k+1]; heldVelocities[k]=heldVelocities[k+1]; }
+        --heldCount; break;
+    }
+    if(heldCount==0){clearSequenceGates();seqLastNote=-1;}
+}
+void Engine::allNotesOff() {
+    keyCount=0;
+    for (auto& v : voices) { v.gate=false; v.stage=3; v.releaseStart=v.env;v.envelopeProgress=0;v.forcedRelease=.005f; }
+    heldCount=0; sequenceFinished=false;seqTicks=0;seqBounce=1;seqLastNote=-1; seqStep=-1;seqPositionPending=-1; seqPhase=0;
+    for(auto& ball:balls)ball.active=false;
+    clearSequenceGates();
+    ballClock=0;
+}
+void Engine::beginMidiBlock(){
+    midiEventSize=0;midiOverflow=false;midiFrame=0;midiFrameCursor=0;
+    if(pendingMidiOverflow){midiEventBuffer[0]={-1,0,false,0};midiEventSize=1;midiOverflow=true;}
+    else for(size_t i=0;i<pendingMidiSize;++i)midiEventBuffer[midiEventSize++]=pendingMidiEvents[i];
+    pendingMidiSize=0;pendingMidiOverflow=false;
+}
+void Engine::emitSequenceMidi(int note,float velocity,bool on){
+    auto& events=midiProcessing?midiEventBuffer:pendingMidiEvents;
+    auto& size=midiProcessing?midiEventSize:pendingMidiSize;
+    auto& overflow=midiProcessing?midiOverflow:pendingMidiOverflow;
+    if(overflow)return;
+    const int frame=midiProcessing?midiFrame:0;
+    if(size==events.size()){size=1;events[0]={-1,0,false,frame};overflow=true;return;}
+    events[size++]={note,on?clamp(velocity):0,on,frame};
+}
+void Engine::clearSequenceGates(){for(auto& gate:noteGates){if(gate.note>=0){emitSequenceMidi(gate.note,0,false);releaseNote(gate.note);}gate={};}}
+void Engine::gatedTrigger(int note,float velocity,double seconds){
+    for(auto& gate:noteGates)if(gate.note==note){emitSequenceMidi(note,0,false);gate={};releaseNote(note);}
+    trigger(note,velocity);emitSequenceMidi(note,velocity,true);
+    auto* slot=&noteGates[0];for(auto& gate:noteGates)if(gate.note<0){slot=&gate;break;}
+    if(slot->note>=0){emitSequenceMidi(slot->note,0,false);releaseNote(slot->note);}
+    slot->note=note;slot->remaining=std::max(1.0,seconds*sr);seqLastNote=note;
+}
+void Engine::tickGates(){
+    for(auto& gate:noteGates)if(gate.note>=0){gate.remaining-=1;if(gate.remaining<=0){emitSequenceMidi(gate.note,0,false);releaseNote(gate.note);gate={};}}
+}
+void Engine::tickSequence() {
+    const int clockLength=params.sequencer==3?fingerLength(fingerSelected):params.sequencer==1&&params.arpTriggerMode==2?std::max(1,heldCount):seqLength;
+    if(sequenceFinished)return;
+    if(seqTicks>=clockLength&&(params.seqPlayMode==1||(params.sequencer==1&&params.arpTriggerMode==2))){sequenceFinished=true;return;}
+    const int direction=params.seqPlayMode==2?2:params.seqDirection;
+    if(seqPositionPending>=0)seqStep=seqPositionPending%clockLength;
+    else if(seqStep<0)seqStep=direction==1?clockLength-1:0;
+    else if(direction==1)seqStep=(seqStep+clockLength-1)%clockLength;
+    else if(direction==2){int next=seqStep+seqBounce;if(next>=clockLength){seqBounce=-1;next=std::max(0,clockLength-2);}if(next<0){seqBounce=1;next=std::min(clockLength-1,1);}seqStep=next;}
+    else if(direction==3)seqStep=std::clamp((int)((noise(randomState)+1)*.499f*clockLength),0,clockLength-1);
+    else seqStep=(seqStep+1)%clockLength;
+    seqPositionPending=-1;++seqTicks;
+    constexpr unsigned masks[]{0xffff,0x5555,0xaaaa,0x1111,0x8888,0x3333,0x7777,0xeeee};
+    if(!(masks[std::clamp(params.seqTriggerPattern,0,7)]&(1u<<(seqStep%16)))){if(params.seqSkipRest)seqStep=(seqStep+1)%clockLength;else {seqLastNote=-1;return;}}
+    const int readStep=((seqStep+params.seqRotate)%clockLength+clockLength)%clockLength;
+    if (heldCount<=0) { seqLastNote=-1; return; }
+    int note=heldNotes[0];float velocity=heldVelocities[0];
+    const double stepSeconds=60.0/params.tempo*sequenceBeats(params.seqDivision)*(1+(seqStep%2==0?params.seqSwing:-params.seqSwing));
+    const double gate=stepSeconds*params.seqGate;
+    switch(params.sequencer){
+        case 1:{
+            int index=seqStep%heldCount;
+            if(params.sequencerMacro[0]>.75f)index=static_cast<int>((noise(randomState)+1)*.499f*heldCount)%heldCount;
+            else if(params.sequencerMacro[0]>.5f && heldCount>1){int n=seqStep%(2*heldCount-2);index=n<heldCount?n:2*heldCount-2-n;}
+            else if(params.sequencerMacro[0]>.25f)index=heldCount-1-index;
+            note=heldNotes[index];velocity=heldVelocities[index];break;
+        }
+        case 2:
+        case 5:
+            if(steps[readStep]<0){seqLastNote=-1;return;}
+            for(int n=0;n<128;++n)if(stepChords[(size_t)readStep][(size_t)n])gatedTrigger(std::clamp(n+heldNotes[0]-60+params.seqTranspose,0,127),stepVelocity[(size_t)readStep]*heldVelocities[0],gate);return;
+        case 3:
+            for(int i=0;i<heldCount;++i){
+                const int bankIndex=((heldNotes[i]-drumBaseNote)%16+16)%16;
+                const auto& bank=fingerBanks[static_cast<size_t>(bankIndex)];const int step=seqStep%bank.length;
+                for(int n=0;n<128;++n)if(bank.chords[(size_t)step][(size_t)n])gatedTrigger(std::clamp(n+params.seqTranspose,0,127),bank.velocity[(size_t)step]*heldVelocities[i],gate);
+            }
+            return;
+        case 4:return;
+        case 6:{
+            const float x=clockLength>1?static_cast<float>(seqStep)/(clockLength-1):0;
+            bool found=false;float y=.5f;
+            for(int i=0;i<sketchCount-1;++i){const auto& a=sketch[static_cast<size_t>(i)];const auto& b=sketch[static_cast<size_t>(i+1)];
+                if(x>=std::min(a.x,b.x) && x<=std::max(a.x,b.x)){
+                    const float length=b.x-a.x;const float t=std::abs(length)<.000001f?0:clamp((x-a.x)/length);
+                    y=a.y+(b.y-a.y)*t;found=true;break;
+                }
+            }
+            if(!found){seqLastNote=-1;return;}
+            note=std::clamp(heldNotes[0]+static_cast<int>(std::round((.5f-y)*24)),0,127);
+            velocity=heldVelocities[0]*(.5f+.5f*params.sequencerMacro[3]);break;
+        }
+        case 7:return;
+        default:return;
+    }
+    gatedTrigger(std::clamp(note+(params.sequencer==1?params.seqTranspose:0),0,127),velocity,gate);
+}
+void Engine::addBall(int note,float velocity){
+    for(size_t i=0;i<balls.size();++i)if(balls[i].active && balls[i].note==note){ballVelocity[i]=clamp(velocity);return;}
+    size_t index=0;for(size_t i=0;i<balls.size();++i)if(!balls[i].active){index=i;break;}
+    balls[index]={.5f+noise(randomState)*.12f,.35f+noise(randomState)*.03f,noise(randomState)*.8f,-.7f-clamp(velocity)*.8f,note,true};
+    ballVelocity[index]=clamp(velocity);ballCooldown[index]=0;
+}
+int Engine::tombolaSides() const {return std::clamp(3+static_cast<int>(params.sequencerMacro[2]*5.999f),3,8);}
+void Engine::tickTombola(){
+    constexpr float dt=1.0f/120,radius=.018f;
+    const float rotation=(params.sequencerMacro[0]-.5f)*4;
+    ballAngle=std::remainder(ballAngle+rotation*dt,tau);
+    const int sides=tombolaSides();const float boundary=.44f*static_cast<float>(std::cos(pi/sides))-radius;
+    const float gravity=.5f+12*params.sequencerMacro[1],restitution=.2f+.78f*params.sequencerMacro[3];
+    const double gate=60.0/(params.tempo*4.0)*params.seqGate;
+    for(size_t i=0;i<balls.size();++i){auto& ball=balls[i];if(!ball.active)continue;
+        ballCooldown[i]=std::max(0.0f,ballCooldown[i]-dt);ball.vy+=gravity*dt;ball.vx*=.9995f;ball.vy*=.9995f;
+        ball.x+=ball.vx*dt;ball.y+=ball.vy*dt;
+        float impact=0;
+        for(int pass=0;pass<2;++pass)for(int wall=0;wall<sides;++wall){
+            const double angle=ballAngle+wall*tau/sides;const float nx=static_cast<float>(std::cos(angle)),ny=static_cast<float>(std::sin(angle));
+            const float distance=(ball.x-.5f)*nx+(ball.y-.5f)*ny-boundary;
+            if(distance>0){
+                ball.x-=distance*nx;ball.y-=distance*ny;
+                const float wallVx=-rotation*(ball.y-.5f),wallVy=rotation*(ball.x-.5f);
+                const float speed=(ball.vx-wallVx)*nx+(ball.vy-wallVy)*ny;
+                if(speed>0){ball.vx-=(1+restitution)*speed*nx;ball.vy-=(1+restitution)*speed*ny;impact=std::max(impact,speed);}
+            }
+        }
+        ball.x=clamp(ball.x,radius,1-radius);ball.y=clamp(ball.y,radius,1-radius);
+        ball.vx=clamp(ball.vx,-8,8);ball.vy=clamp(ball.vy,-8,8);
+        if(impact>.07f && ballCooldown[i]<=0){gatedTrigger(ball.note,ballVelocity[i]*clamp(.2f+impact*.35f),gate);++ballTriggers;ballCooldown[i]=.035f;}
+    }
+    // Equal-mass ball collisions transfer momentum; container impacts trigger
+    // notes. Fixed120Hz stepping keeps simulation independent of block size.
+    for(size_t i=0;i<balls.size();++i)if(balls[i].active)for(size_t j=i+1;j<balls.size();++j)if(balls[j].active){
+        auto& a=balls[i];auto& b=balls[j];const float dx=b.x-a.x,dy=b.y-a.y,d2=dx*dx+dy*dy;
+        if(d2>0.000001f && d2<4*radius*radius){
+            const float distance=std::sqrt(d2),nx=dx/distance,ny=dy/distance;
+            const float shift=(2*radius-distance)*.5f;a.x-=shift*nx;a.y-=shift*ny;b.x+=shift*nx;b.y+=shift*ny;
+            const float speed=(b.vx-a.vx)*nx+(b.vy-a.vy)*ny;if(speed<0){const float impulse=-(1+restitution)*speed*.5f;a.vx-=impulse*nx;a.vy-=impulse*ny;b.vx+=impulse*nx;b.vy+=impulse*ny;}
+        }
+    }
+    // Pair separation can push a neighbour into a wall. Reproject the final
+    // snapshot so every published centre stays inside the same container.
+    for(auto& ball:balls)if(ball.active){
+        for(int pass=0;pass<3;++pass)for(int wall=0;wall<sides;++wall){const double angle=ballAngle+wall*tau/sides;const float nx=static_cast<float>(std::cos(angle)),ny=static_cast<float>(std::sin(angle));const float distance=(ball.x-.5f)*nx+(ball.y-.5f)*ny-boundary;if(distance>0){ball.x-=distance*nx;ball.y-=distance*ny;}}
+        ball.x=clamp(ball.x,radius,1-radius);ball.y=clamp(ball.y,radius,1-radius);
+    }
+}
+std::pair<float,float> Engine::renderDbox(Voice& v,float /*modulation*/){
+    const auto& p=v.dbox;
+    const float pitch=voiceRoute(0,v.velocity)*(params.lfoModel&&params.lfo==3?24.f:.7f);
+    const float mix=clamp(p.mix+(voiceRoute(1,v.velocity)*.5f));
+    const float wave1=clamp(p.wave1+(voiceRoute(2,v.velocity)*.5f));
+    const float cross=clamp(p.crossMod+(voiceRoute(4,v.velocity)*.5f));
+    const float wave2=clamp(p.wave2+voiceRoute(3,v.velocity)*.5f);
+    const double frequency=std::min(sr*.3,25.0*std::pow(2.0,p.frequency*8.0+(pitch+pitchBend)/12.0));
+    const double dt=frequency/sr,dt2=std::min(.42,dt*(1.0+std::floor(wave2*7.0)));
+    const float n1=noise(v.noise),n2=noise(v.noise);
+    auto shape=[&](double phase,double increment,float wave,float n){
+        const float shapes[5]{sine(phase),static_cast<float>(1-4*std::abs(phase-.5)),saw(phase,increment),pulse(phase,increment,.5),n};
+        const float at=clamp(wave)*4;const int a=std::min(3,static_cast<int>(at));return shapes[a]+(shapes[a+1]-shapes[a])*(at-a);
+    };
+    const double age=v.age;
+    const float env1=static_cast<float>(std::exp(-age/(p.envelope1*(params.lfoModel?std::pow(4.f,voiceRoute(9,v.velocity)):1))));
+    const float env2=static_cast<float>(std::exp(-age/(p.envelope2*(params.lfoModel?std::pow(4.f,voiceRoute(11,v.velocity)):1))));
+    const float osc2=shape(v.phase2,dt2,wave2,n2);
+    const float osc1=shape(wrap(v.phase+osc2*cross*1.5),dt,wave1,n1);
+    float signal=osc1*env1*(1-mix)+osc2*env2*mix;
+    // Smooth regulates transient slew before the resonant low-pass stage.
+    const float smoothing=1-std::exp(-1.0f/(static_cast<float>(sr)*(.00001f+p.smooth*.0004f)));
+    v.dboxPrevious+=smoothing*(signal-v.dboxPrevious);signal=v.dboxPrevious;
+    if(params.lfoModel&&--v.dboxControlCountdown<=0){v.dboxControlCountdown=16;const float position=clamp(p.cutoff+voiceRoute(7,v.velocity)*.5f);if(position!=v.dboxLastCutoff){v.dboxLastCutoff=position;const double cutoff=std::min(sr*.4,80.0+position*position*16000.0),omega=tau*cutoff/sr,alpha=std::sin(omega)/(2*(.55+p.crossMod*3)),a0=1+alpha;v.dboxFilter={static_cast<float>((1-std::cos(omega))*.5/a0),static_cast<float>((1-std::cos(omega))/a0),static_cast<float>((1-std::cos(omega))*.5/a0),static_cast<float>(-2*std::cos(omega)/a0),static_cast<float>((1-alpha)/a0)};}}
+    const auto& f=v.dboxFilter;const float filtered=f[0]*signal+v.dboxLowL;
+    v.dboxLowL=f[1]*signal-f[3]*filtered+v.dboxBandL;v.dboxBandL=f[2]*signal-f[4]*filtered;
+    const float attack=static_cast<float>(std::min(1.0,age/(p.attack*(params.lfoModel?std::pow(4.f,voiceRoute(8,v.velocity)):1))));
+    const double tail=std::max(0.0,age-std::max(p.envelope1,p.envelope2)*4.0);
+    const float transient=attack*static_cast<float>(std::exp(-tail/p.release));
+    if(!v.gate || v.stage==3){
+        const float duration=v.forcedRelease>0?v.forcedRelease:p.release;
+        v.env=std::max(0.0f,v.env-v.releaseStart/(duration*static_cast<float>(sr)));
+        if(v.env<=.000001f)v.active=false;
+    }else v.env=transient;
+    const float velocityGain=params.lfoModel&&params.lfoEnabled&&params.lfo==5?1-params.lfoVelocityVolume+v.velocity*params.lfoVelocityVolume:v.velocity;
+    const float gain=p.gain*velocityGain*.65f*v.env*(params.lfoModel?std::max(0.f,1+voiceRoute(10,v.velocity)*.5f):1)*(std::max(0.0f,1+voiceRoute(5,v.velocity)));
+    const float pan=clamp(voiceRoute(6,v.velocity),-1,1);
+    const float out=std::tanh(filtered*1.2f)*gain;
+    v.phase=wrap(v.phase+dt);v.phase2=wrap(v.phase2+dt2);v.age+=1.0/sr;
+    if(env1+env2<.00001f || age>20)v.active=false;
+    return {out*(pan>0?1-pan:1),out*(pan<0?1+pan:1)};
+}
+std::pair<float,float> Engine::renderVoice(Voice& v,float modulation,float inL,float inR) {
+    if (!v.active) return {0,0};
+    if(v.engine==14)return renderDbox(v,modulation);
+    const float target=v.note+v.detune;if(!v.drum&&(params.voiceMode==1||params.voiceMode==2)&&params.glideTime>0)v.pitch+=(target-v.pitch)*(1-std::exp(-1.f/(params.glideTime*(float)sr)));else v.pitch=target;
+    const float attack=std::clamp(params.attack*(voiceRoute(8,v.velocity)==0?1.f:std::pow(4.f,voiceRoute(8,v.velocity))),.001f,40.f);
+    const float decay=std::clamp(params.decay*(voiceRoute(9,v.velocity)==0?1.f:std::pow(4.f,voiceRoute(9,v.velocity))),.001f,40.f);
+    const float sustain=clamp(params.sustain+voiceRoute(10,v.velocity)*.5f);
+    const float release=v.forcedRelease>0?v.forcedRelease:std::clamp(params.release*(voiceRoute(11,v.velocity)==0?1.f:std::pow(4.f,voiceRoute(11,v.velocity))),.001f,40.f);
+    if(params.envelopeCurve==1){
+        const float duration=v.stage==0?attack:v.stage==1?decay:release;
+        if(v.stage==2)v.env=sustain;
+        else {
+            v.envelopeProgress=std::min(1.f,v.envelopeProgress+1.f/(duration*static_cast<float>(sr)));
+            const float shaped=(1.f-std::exp(-5.f*v.envelopeProgress))/(1.f-std::exp(-5.f));
+            v.env=v.stage==0?shaped:v.stage==1?1.f-(1.f-sustain)*shaped:v.releaseStart*(1.f-shaped);
+            if(v.envelopeProgress>=1){v.envelopeProgress=0;if(v.stage==3){v.active=false;return {0,0};}++v.stage;}
+        }
+    }else{
+        const float a=1.f/(attack*static_cast<float>(sr)), d=(1.f-sustain)/(decay*static_cast<float>(sr));
+        if(v.stage==0){v.env+=a;if(v.env>=1){v.env=1;v.stage=1;}}
+        else if(v.stage==1){v.env-=d;if(v.env<=sustain){v.env=sustain;v.stage=2;}}
+        else if(v.stage==2)v.env=sustain;
+        else {v.env-=std::max(.0000001f,v.releaseStart/(release*static_cast<float>(sr)));if(v.env<=0){v.active=false;return {0,0};}}
+    }
+    const float pitchMod=voiceRoute(0,v.velocity)*(params.lfoModel&&params.lfo==3?24.f:.7f);
+    const float frequencyKey=v.pitch-69+pitchBend+pitchMod;
+    if(frequencyKey!=v.frequencyKey){v.frequencyKey=frequencyKey;v.frequency=std::clamp(440.0*std::pow(2.0,frequencyKey/12.0),8.0,sr*.42);}
+    const double freq=v.frequency;
+    const double dt=freq/sr;
+    const float x=clamp(params.macro[0]+(voiceRoute(1,v.velocity)*.5f));
+    const float y=clamp(params.macro[1]+(voiceRoute(2,v.velocity)*.5f));
+    const float z=clamp(params.macro[2]+(voiceRoute(3,v.velocity)*.5f));
+    const float w=clamp(params.macro[3]+(voiceRoute(4,v.velocity)*.5f));
+    float l=0,r=0;
+    if (v.drum && v.engine!=11) {
+        const int kind=drumPadIndex(v.note)%12;
+        const float age=static_cast<float>(v.age);
+        const float n=noise(v.noise);
+        if (kind==0 || kind==1 || kind==7) {
+            const float base=35.0f+x*100.0f;
+            v.phase=wrap(v.phase+(base+180.0*std::exp(-age*(25+y*90)))/sr);
+            l=(sine(v.phase)+n*.06f*std::exp(-age*180))*std::exp(-age*(3+w*18));
+        } else if (kind==2 || kind==3 || kind==5) {
+            v.phase=wrap(v.phase+(100+x*200)/sr);
+            l=(n*(.6f+.35f*z)+sine(v.phase)*.4f)*std::exp(-age*(7+w*25));
+        } else {
+            v.lp+=.35f*(n-v.lp);
+            l=(n-v.lp)*std::exp(-age*(kind==6?4.0f:18.0f+w*60));
+        }
+        r=l;
+        if (age>3 || (std::abs(l)<.00001f && age>1)) v.active=false;
+    } else {
+        const double p=v.phase, q=v.phase2;
+        const float n=noise(v.noise);
+        switch (v.engine) {
+            case 0: { // Original phase-modulated, detuned electrical oscillator.
+                const float left=saw(wrap(p+sine(q)*x*.12),dt)*.65f+pulse(q,dt,.5)*.35f+n*y*.18f;
+                const float right=saw(wrap(q+sine(p)*x*.12),dt)*.65f+pulse(p,dt,.5)*.35f+n*y*.18f;
+                const float a=.05f+z*.9f;l=-a*left+v.lp;v.lp=left+a*l;r=-a*right+v.hp;v.hp=right+a*r;break;
+            }
+            case 1: { // FM: carrier/modulator ratios and feedback-like phase warp.
+                const double ratio=1+std::round(x*11);
+                l=static_cast<float>(std::sin(tau*p+(y*y*14.0)*std::sin(tau*q*ratio+z*std::sin(tau*p))));
+                r=static_cast<float>(std::sin(tau*p+(y*y*14.0)*std::sin(tau*q*ratio+w*.12))); break;
+            }
+            case 2: { // Cluster: spread detuned oscillators.
+                l=(saw(p,dt)+saw(wrap(q),dt)+saw(wrap(p+q*.003*(1+x)),dt))*.33f;
+                r=(saw(p,dt)+saw(wrap(p-(q-p)*(1+y)),dt)+sine(q))*.33f; break;
+            }
+            case 3: { // Digital: quantised additive harmonics.
+                const int h=2+static_cast<int>(x*14);
+                float out=sine(p)+sine(p*h)*y+sine(p*(h+1))*z*.5f;
+                const float levels=4.0f+std::pow(2.0f,w*10);
+                l=r=std::round(out*levels)/levels*.5f; break;
+            }
+            case 4: { // Dr Wave: stepped shape through a wave-shaping function.
+                const double shape=p+std::sin(tau*p*(1+std::round(y*5)))*x*.18;
+                l=std::tanh(static_cast<float>(std::sin(tau*shape))*(1+z*9));
+                r=std::tanh(static_cast<float>(std::sin(tau*(shape+w*.015)))*(1+z*9)); break;
+            }
+            case 5: { // Dimension: stereo unison chord oscillator.
+                const double fifth=std::pow(2.0,7.0/12.0);
+                l=(sine(p)+saw(q,dt)*x+sine(p*fifth)*y*.5f)*.55f;
+                r=(sine(p)+saw(wrap(p-(q-p)),dt)*x+sine(p*fifth+w*.03)*y*.5f)*.55f; break;
+            }
+            case 6: { // Original fractional-delay waveguide with stereo detune.
+                auto readString=[&](double offset){double at=v.stringPos-std::clamp(offset,2.,4094.);if(at<0)at+=4096;if(at>=4096)at=0;int j=(int)at,k=(j+1)%4096;return v.string[(size_t)j]+(v.string[(size_t)k]-v.string[(size_t)j])*(float)(at-j);};
+                l=readString(sr/freq);r=readString(sr/(freq*(1+z*.01)));
+                v.string[(size_t)v.stringPos]=(l*(.35f+x*.3f)+v.stringPrevious*(.65f-x*.3f))*(.98f+y*.0198f);v.stringPrevious=l;v.stringPos=(v.stringPos+1)%4096;break;
+            }
+            case 7: { // Independent filter, amplitude, second pulse and modulation.
+                const double mod=sine(q)*w*.12;
+                l=y*(pulse(wrap(p+mod),dt,.25)+z*pulse(wrap(p+.27-mod),dt,.4))/(1+z);
+                r=y*(pulse(wrap(q+mod),dt,.25)+z*pulse(wrap(q+.27-mod),dt,.4))/(1+z);break;
+            }
+            case 8: { // Phase: phase distortion.
+                const double pivot=.05+.9*x;
+                const double warped=p<pivot ? p*.5/pivot : .5+(p-pivot)*.5/(1-pivot);
+                l=sine(warped+y*std::sin(tau*p)*.4); r=sine(warped+z*std::sin(tau*p)*.4); break;
+            }
+            case 9: { // DNA: deterministic noise-modulated tonal texture.
+                const double cell=std::floor(p*(4+std::round(x*60)));
+                const float granular=dnaCells[(size_t)v.note][(size_t)cell];
+                l=sine(p)*(1-y)+granular*y+n*z*.15f;
+                r=l*(1-w*.2f)+sine(q)*w*.2f; break;
+            }
+            case 10: { // DSynth: independently shaped dual oscillators.
+                l=saw(p,dt)*(1-x)+pulse(p,dt,.1+.8*y)*x;
+                r=sine(q)*(1-z)+saw(q,dt)*z;
+                const float mid=(l+r)*.5f; l=mid*(1-w)+l*w; r=mid*(1-w)+r*w; break;
+            }
+            case 11: {
+                if(!v.sampleAsset || v.sampleAsset->left.empty() || v.sampleFinish<=v.sampleBegin){v.active=false;return {0,0};}
+                const bool reverse=v.drum?v.sampleReverse:params.sampleReverse;
+                l=interpolate(v.sampleAsset->left,v.samplePos);r=interpolate(v.sampleAsset->right,v.samplePos);
+                const bool loop=v.sampleLooped&&v.gate&&v.sampleLoopFinish-v.sampleLoopBegin>=1;
+                const double span=v.sampleLoopFinish-v.sampleLoopBegin,fade=loop&&!v.drum?span*.5*params.sampleLoopFade:0;
+                if(fade>0){double secondary=0,blend=0;if(!reverse&&v.samplePos>=v.sampleLoopFinish-fade&&v.samplePos<v.sampleLoopFinish){blend=(v.samplePos-(v.sampleLoopFinish-fade))/fade;secondary=v.sampleLoopBegin+v.samplePos-(v.sampleLoopFinish-fade);}else if(reverse&&v.samplePos<v.sampleLoopBegin+fade&&v.samplePos>=v.sampleLoopBegin){blend=(v.sampleLoopBegin+fade-v.samplePos)/fade;secondary=v.sampleLoopFinish-fade+(v.samplePos-v.sampleLoopBegin);}if(blend>0){l=l*(1-(float)blend)+interpolate(v.sampleAsset->left,secondary)*(float)blend;r=r*(1-(float)blend)+interpolate(v.sampleAsset->right,secondary)*(float)blend;}}
+                if(!v.drum){l*=params.sampleGain;r*=params.sampleGain;}
+                l*=v.sampleLevel*(v.samplePan>0?1-v.samplePan:1);
+                r*=v.sampleLevel*(v.samplePan<0?1+v.samplePan:1);
+                const double tune=v.sampleTune+(v.drum?0:v.pitch-v.sampleRootNote+params.sampleFineTune)+pitchBend+pitchMod;
+                if(tune!=v.sampleStepKey){v.sampleStepKey=tune;v.sampleStep=v.sampleAsset->sampleRate/sr*std::pow(2.0,tune/12.0);}
+                const double inc=v.sampleStep*(reverse?-1:1);
+                v.samplePos+=inc;
+                if(loop){
+                    if(!reverse && v.samplePos>=v.sampleLoopFinish)
+                        v.samplePos=v.sampleLoopBegin+fade+std::fmod(v.samplePos-v.sampleLoopFinish,span-fade);
+                    else if(reverse && v.samplePos<v.sampleLoopBegin)
+                        {if(fade>0){double offset=std::fmod(v.samplePos-v.sampleLoopBegin,span-fade);if(offset<0)offset+=span-fade;v.samplePos=v.sampleLoopBegin+offset;}else v.samplePos=v.sampleLoopFinish-1-std::fmod(v.sampleLoopBegin-v.samplePos-1,span);}
+                }
+                if(v.samplePos>=v.sampleFinish || v.samplePos<v.sampleBegin)v.active=false;
+                break;
+            }
+            case 12: { // Original twelve-band analysis/synthesis vocoder.
+                const int wave=std::min(7,(int)(x*8));
+                auto carrier=[&](double phase){switch(wave){case 0:return saw(phase,dt);case 1:return pulse(phase,dt,.5);case 2:return (float)(1-4*std::abs(phase-.5));case 3:return sine(phase);case 4:return pulse(phase,dt,.2);case 5:return .7f*saw(phase,dt)+.3f*sine(wrap(phase*2));case 6:return pulse(phase,dt,.7);default:return .5f*saw(phase,dt)+.5f*pulse(wrap(phase*2),dt,.5);}};
+                const float carrierL=carrier(p),carrierR=carrier(wrap(p+.003));
+                for(size_t band=0;band<(size_t)vocoderCount;++band){
+                    const auto& b=vocoder[band];
+                    const float cl=b.b0*carrierL+v.vocL1[band];
+                    v.vocL1[band]=-b.a1*cl+v.vocL2[band];v.vocL2[band]=b.b2*carrierL-b.a2*cl;
+                    const float cr=b.b0*carrierR+v.vocR1[band];
+                    v.vocR1[band]=-b.a1*cr+v.vocR2[band];v.vocR2[band]=b.b2*carrierR-b.a2*cr;
+                    const float shifted=std::clamp((float)band-(y-.5f)*vocoderCount*.8f,0.f,(float)(vocoderCount-1));const int lo=(int)shifted,hi=std::min(vocoderCount-1,lo+1);const float envelope=vocoder[(size_t)lo].envelope+(vocoder[(size_t)hi].envelope-vocoder[(size_t)lo].envelope)*(shifted-lo);
+                    l+=cl*envelope*18;r+=cr*envelope*18;
+                }
+                break;
+            }
+            case 13: l=std::tanh(inL*(1+x*14))*(.4f+y*.6f); r=std::tanh(inR*(1+x*14))*(.4f+y*.6f); break;
+            default: break;
+        }
+        v.phase=wrap(v.phase+dt);
+        v.phase2=wrap(v.phase2+dt*(1.0+(v.engine==0?w*.02:(x-.5)*.025)));
+        const float filter=clamp((v.engine==7?x:z)+(voiceRoute(7,v.velocity)*.5f));
+        const float cutoff=std::min(static_cast<float>(sr*.4),100.0f+filter*filter*18000.0f);
+        if(cutoff!=v.filterKey){v.filterKey=cutoff;v.filterCoefficient=1.0f-std::exp(-static_cast<float>(tau)*cutoff/static_cast<float>(sr));}
+        const float coefficient=v.filterCoefficient;
+        if((v.engine!=11&&v.engine!=0&&v.engine!=6&&v.engine!=12) || (voiceRoute(7,v.velocity)!=0)){
+            v.lp+=coefficient*(l-v.lp);
+            v.hp+=coefficient*(r-v.hp);
+            l=v.lp; r=v.hp;
+        }
+    }
+    v.age+=1.0/sr;
+    const float volumeMod=std::max(0.0f,1+voiceRoute(5,v.velocity));
+    const float pan=clamp(voiceRoute(6,v.velocity),-1,1);
+    const float velocityGain=params.lfoModel&&params.lfoEnabled&&params.lfo==5?1-params.lfoVelocityVolume+v.velocity*params.lfoVelocityVolume:v.velocity;
+    const float gain=v.env*velocityGain*(v.engine==11?1.f:(v.drum?.42f:.19f))*volumeMod;
+    return {l*gain*(pan>0?1-pan:1),r*gain*(pan<0?1+pan:1)};
+}
+std::pair<float,float> Engine::effect(float l,float r) {
+    if (delayL.empty()) return {l,r};
+    auto read=[&](const std::vector<float>& d,double samples) {
+        double index=static_cast<double>(delayWrite)-std::clamp(samples,1.0,static_cast<double>(d.size()-2));
+        if(index<0)index+=d.size();
+        // A tiny negative offset can round to exactly size after wrapping.
+        // Treat that boundary as zero before converting to an array index.
+        if(index>=static_cast<double>(d.size()))index=0;
+        const size_t i=static_cast<size_t>(index), n=(i+1)%d.size();
+        const float fraction=static_cast<float>(index-i);
+        return d[i]+fraction*(d[n]-d[i]);
+    };
+    const float x=clamp(params.effectMacro[0]+modulationRoutes[12]*.5f), y=clamp(params.effectMacro[1]+modulationRoutes[13]*.5f), z=clamp(params.effectMacro[2]+modulationRoutes[14]*.5f), w=clamp(params.effectMacro[3]+modulationRoutes[15]*.5f);
+    float wetL=l,wetR=r,feedbackL=0,feedbackR=0,inputGain=1;
+    const float tapL=read(delayL,(.04+x*.71)*sr), tapR=read(delayR,(.057+x*.713)*sr);
+    fxPhase=wrap(fxPhase+(0.05+y*1.8)/sr);
+    switch(params.effect) {
+        case 1: {
+            const double target=delaySeconds(x,y)*sr;if(plainDelay<0)plainDelay=target;else plainDelay+=(target-plainDelay)*cwoDelaySmoothing;
+            const float echoL=read(delayL,plainDelay),echoR=read(delayR,plainDelay);
+            // The orange control feeds the delay, not its output: turning it
+            // down leaves existing feedback echoes alive and keeps dry audio.
+            inputGain=w;feedbackL=echoR*z*.94f;feedbackR=echoL*z*.94f;wetL=l+echoL;wetR=r+echoR;break;
+        }
+        case 2: { // Short dispersive feedback taps: spring-inspired, not a model of TE's engine.
+            wetL=read(delayL,sr*.0311)+read(delayR,sr*.0477)*.7f+read(delayL,sr*.0713)*.5f;
+            wetR=read(delayR,sr*.0371)+read(delayL,sr*.0537)*.7f+read(delayR,sr*.0793)*.5f;
+            wetL*=.5f;wetR*=.5f;feedbackL=wetR*(.45f+y*.4f);feedbackR=wetL*(.45f+y*.4f);break;
+        }
+        case 3: { // Original two-axis cross-feedback delay grid.
+            const double a=(.025+x*.45)*sr,b=(.035+y*.55)*sr;
+            wetL=(read(delayL,a)+read(delayR,b*1.17))*.5f;wetR=(read(delayR,b)+read(delayL,a*1.31))*.5f;
+            feedbackL=wetR*z*.94f;feedbackR=wetL*z*.94f;break;
+        }
+        case 4: { // State-variable-like filter.
+            const float coeff=1-std::exp(-static_cast<float>(tau)*(100+std::pow(x,2)*12000)/static_cast<float>(sr));
+            fxLowL+=coeff*(l-fxLowL);fxLowR+=coeff*(r-fxLowR);
+            wetL=fxLowL*(1-y)+(l-fxLowL)*y;wetR=fxLowR*(1-y)+(r-fxLowR)*y; break;
+        }
+        case 5: {
+            const float low=1-std::exp(-static_cast<float>(tau)*3500/static_cast<float>(sr));
+            const float high=1-std::exp(-static_cast<float>(tau)*420/static_cast<float>(sr));
+            fxLowL+=low*(l-fxLowL);fxLowR+=low*(r-fxLowR);
+            fxBandL+=high*(fxLowL-fxBandL);fxBandR+=high*(fxLowR-fxBandR);
+            wetL=std::tanh((fxLowL-fxBandL)*(2+x*7));wetR=std::tanh((fxLowR-fxBandR)*(2+x*7));break;
+        }
+        case 6: wetL=std::tanh(l*(1+x*15))*.8f;wetR=std::tanh(r*(1+x*15))*.8f;break;
+        case 7: {
+            // Independent controls: blue shift rate, ochre delay, grey loop
+            // feedback, orange lower/upper sideband blend. The shift is inside
+            // the feedback loop, so successive echoes acquire further shifts.
+            const double target=1+y*y*.8*sr;
+            if(cwoDelay<0)cwoDelay=target;else cwoDelay+=(target-cwoDelay)*cwoDelaySmoothing;
+            const float frequency=.02f+x*x*x*std::min(2000.f,(float)(sr*.2));
+            const auto shifted=cwoShifter.process(read(delayL,cwoDelay),read(delayR,cwoDelay),frequency,w);
+            feedbackL=shifted[0]*z*.94f;feedbackR=shifted[1]*z*.94f;
+            // The field demonstration introduces dry sound as Feedback rises.
+            // Its exact gain curve is unmeasured; this is our bounded model.
+            wetL=shifted[0]+l*z*.5f;wetR=shifted[1]+r*z*.5f;break;
+        }
+        case 8: { const float levels=4+std::pow(2.0f,(1-x)*10); wetL=std::round((l+tapL*y*.4f)*levels)/levels;wetR=std::round((r+tapR*y*.4f)*levels)/levels;feedbackL=wetL*.35f;feedbackR=wetR*.35f;break; }
+        case 9: { // Original distance/gated-room model; not recovered TE DSP.
+            if(std::max(std::abs(l),std::abs(r))>1e-5f)motherGateRemaining=sr*(.03+y*y*2);else motherGateRemaining=std::max(0.,motherGateRemaining-1);
+            const double distance=(.02+x*.25)*sr;
+            const float roomL=(read(delayL,distance)+read(delayR,distance*1.37)+read(delayL,distance*1.71))*.333333f;
+            const float roomR=(read(delayR,distance*1.09)+read(delayL,distance*1.49)+read(delayR,distance*1.93))*.333333f;
+            const float colour=1-std::exp(-static_cast<float>(tau)*std::min((float)sr*.42f,200+z*z*18000)/(float)sr);
+            wetLowL+=colour*(roomL-wetLowL);wetLowR+=colour*(roomR-wetLowR);
+            const float gate=(float)std::min(1.,motherGateRemaining/(sr*.005));wetL=wetLowL*gate;wetR=wetLowR*gate;feedbackL=wetR*.65f;feedbackR=wetL*.65f;break;
+        }
+        case 10: { // Four-stage all-pass phaser.
+            const float a=.1f+.8f*(.5f+.5f*sine(fxPhase));float dl=l,dr=r;
+            for(size_t j=0;j<4;++j){float nl=-a*dl+phaserL[j];phaserL[j]=dl+a*nl;dl=nl;float nr=-a*dr+phaserR[j];phaserR[j]=dr+a*nr;dr=nr;}
+            wetL=dl;wetR=dr;break;
+        }
+        default: break;
+    }
+    if(params.effect==1){const float clockRatio=(float)std::exp2((y-.5)*2);const auto input=plainDelayColor.process(l*inputGain+feedbackL,r*inputGain+feedbackR,clockRatio);delayL[delayWrite]=std::tanh(input[0]);delayR[delayWrite]=std::tanh(input[1]);}
+    else {delayL[delayWrite]=std::tanh(l+feedbackL);delayR[delayWrite]=std::tanh(r+feedbackR);}
+    delayWrite=(delayWrite+1)%delayL.size();
+    // Delay and CWO have dedicated four-control paths. Other software
+    // effects retain their wet-tone and stereo-width processing.
+    if(params.effect!=7&&params.effect!=1&&params.effect!=3&&params.effect!=9){
+        if(z!=effectToneKey){effectToneKey=z;effectToneCoefficient=1-std::exp(-static_cast<float>(tau)*std::min(static_cast<float>(sr*.42),200+z*z*18000)/static_cast<float>(sr));}
+        const float tone=effectToneCoefficient;
+        wetLowL+=tone*(wetL-wetLowL);wetLowR+=tone*(wetR-wetLowR);
+        const float mid=(wetLowL+wetLowR)*.5f,side=(wetLowL-wetLowR)*w;
+        wetL=mid+side;wetR=mid-side;
+    }
+    const float mix=params.effect==0?0:clamp(params.effectMix+modulationRoutes[16]*.5f)*((params.effect==3||params.effect==9)?w:1);
+    return {l*(1-mix)+wetL*mix,r*(1-mix)+wetR*mix};
+}
+void Engine::process(float* left,float* right,const float* inputLeft,const float* inputRight,int frames,float* const* stems) {
+    if(!left || !right || frames<=0)return;
+    trackPeaks.fill(0);
+    const bool anySolo=std::any_of(tape.begin(),tape.end(),[](const Track& t){return t.solo;});
+    midiProcessing=true;midiFrame=midiFrameCursor;
+    if(pendingMidiOverflow){midiEventBuffer[0]={-1,0,false,midiFrame};midiEventSize=1;midiOverflow=true;}
+    else for(size_t i=0;i<pendingMidiSize;++i)emitSequenceMidi(pendingMidiEvents[i].note,pendingMidiEvents[i].velocity,pendingMidiEvents[i].on);
+    pendingMidiSize=0;pendingMidiOverflow=false;
+    for(int i=0;i<frames;++i){
+        midiFrame=static_cast<int>(std::min<int64_t>(2147483647,static_cast<int64_t>(midiFrameCursor)+i));
+        if(stems)for(int channel=0;channel<8;++channel)if(stems[channel])stems[channel][i]=0;
+        const float rawL=inputLeft?inputLeft[i]:0,rawR=inputRight?inputRight[i]:rawL;
+        const float inL=std::isfinite(rawL)?rawL:0,inR=std::isfinite(rawR)?rawR:0;
+        tickGates();
+        if(params.sequenceOn && params.sequencer==7){ballClock+=120.0/sr;while(ballClock>=1){ballClock-=1;tickTombola();}}
+        else if(params.sequenceOn && params.sequencer>0 && params.sequencer!=4 && heldCount>0&&!sequenceFinished&&!(params.sequencer==2&&params.seqManual)){
+            seqPhase+=params.tempo/(60.0*sr)/sequenceBeats(params.seqDivision);
+            const double length=1+(seqStep%2==0?params.seqSwing:-params.seqSwing);
+            if(seqPhase+1e-10>=length){seqPhase=std::max(0.0,seqPhase-length);tickSequence();}
+        }
+        const float envTarget=(std::abs(inL)+std::abs(inR))*.5f;
+        inputEnv+=(envTarget>inputEnv?.01f:.0005f)*(envTarget-inputEnv);
+        constexpr double beats[]{16,8,4,2,1,.75,.5,.375,.25,.1875,.125,.0625};
+        const double rate=params.lfoSync?params.tempo/(60.*beats[params.lfoDivision]):params.lfoRate;
+        lfoEnvelopeAge+=1/sr;
+        lfoPhase=wrap(lfoPhase+rate/sr);
+        lfoClock+=rate/sr;
+        if(lfoClock>=1){lfoClock-=1;randomLfo=noise(randomState);for(size_t h=0;h+1<randomLfoHistory.size();++h)randomLfoHistory[h]=randomLfoHistory[h+1];randomLfoHistory.back()=randomLfo;}
+        float modulation=0;
+        switch(params.lfo){case 0:modulation=randomLfo;break;case 1:{float source=inputEnv;if(params.elementSource==1){source=0;for(const auto& voice:voices)if(voice.active)source=std::max(source,voice.env);}else if(params.elementSource==2)source=previousOutputEnvelope;else if(params.elementSource==3)source=params.elementManual;modulation=clamp(source)*2-1;break;}case 2:modulation=modWheel*2-1;break;case 3:switch(params.lfoWaveform){case 0:modulation=sine(lfoPhase);break;case 1:modulation=1.f-4.f*std::abs(static_cast<float>(lfoPhase)-.5f);break;case 2:modulation=static_cast<float>(lfoPhase)*2-1;break;case 3:modulation=lfoPhase<.5?1.f:-1.f;break;case 4:modulation=2.f*(std::exp(4.f*static_cast<float>(lfoPhase))-1.f)/(std::exp(4.f)-1.f)-1.f;break;case 5:modulation=lfoPhase<.1?1.f:-1.f;break;}break;case 4:modulation=params.lfoModel?lfoWave(params.lfoWaveform==1?6:params.lfoWaveform,lfoPhase):params.macro[3]*2-1;break;case 5:modulation=heldLfo*2-1;break;default:break;}
+        modulation*=params.lfoDepth;
+        modulationRoutes.fill(0);
+        bool midiMatrix=params.lfoModel&&params.lfo==2;
+        if(params.lfo==2)for(size_t c=0;c<4;++c)if(params.midiLfoDepth[c]!=0&&(!params.lfoModel||midiControllerSeen[c])){midiMatrix=true;auto& route=modulationRoutes[params.midiLfoTargets[c]];route=clamp(route+(midiControllers[c]*2-1)*params.midiLfoDepth[c],-1,1);}
+        if(!midiMatrix)modulationRoutes[params.lfoTarget]=modulation;
+        if(params.lfoModel&&params.lfo==0){const int group=lfoGroup(params.lfoTarget);const float shaped=modulation*lfoEnvelope(params.lfoEnvelope,lfoEnvelopeAge);if(params.lfoRandomAll)for(int n=0;n<lfoGroupSizes[group];++n)modulationRoutes[lfoDestination(group,n)]=shaped;else modulationRoutes[params.lfoTarget]=shaped;}
+        if(params.lfoModel&&params.lfo==3){modulationRoutes.fill(0);const float wave=lfoWave(params.lfoWaveform,lfoPhase);modulationRoutes[0]=wave*params.lfoPitchAmount*lfoEnvelope(params.lfoEnvelope,lfoEnvelopeAge);modulationRoutes[5]=wave*params.lfoVolumeAmount;}
+        if(!params.lfoEnabled)modulationRoutes.fill(0);
+        if(params.engine==12){
+            const float modulator=(inL+inR)*.5f;
+            for(auto& b:vocoder){
+                const float analysed=b.b0*modulator+b.z1;
+                b.z1=-b.a1*analysed+b.z2;b.z2=b.b2*modulator-b.a2*analysed;
+                const float target=std::abs(analysed);
+                b.envelope+=(target>b.envelope?.035f:.0015f)*(target-b.envelope);
+            }
+        }
+        float synthL=0,synthR=0;
+        for(auto& v:voices){if(v.active){const auto s=renderVoice(v,modulation,inL,inR);synthL+=s.first;synthR+=s.second;}if(!v.active)releaseVoiceSample(v);}
+        if(params.engine==12){const float wet=clamp(params.macro[3]);synthL=synthL*wet+inL*(1-wet);synthR=synthR*wet+inR*(1-wet);}
+        // Amp/input processing works without a held key, as an input engine.
+        if(params.engine==13 && !params.drumMode){synthL=std::tanh(inL*(1+params.macro[0]*14))*.65f;synthR=std::tanh(inR*(1+params.macro[0]*14))*.65f;}
+        if(params.monitorInput && params.engine!=13 && params.engine!=12){synthL+=inL;synthR+=inR;}
+        const auto processed=effect(synthL*params.patchGain*std::max(0.f,1+modulationRoutes[17]),synthR*params.patchGain*std::max(0.f,1+modulationRoutes[17]));synthL=processed.first;synthR=processed.second;
+        float mixL=synthL,mixR=synthR;
+        const bool counting=countInRemaining>0&&isPlaying&&isRecording;
+        if(counting){metronomeBeat=0;const double phase=countInElapsed-std::floor(countInElapsed);if(phase<.08){const double seconds=phase*60./params.tempo;const float click=static_cast<float>(std::sin(seconds*(params.metronomeSound==1?850:params.metronomeSound==2?1400:1900)*tau)*std::exp(-seconds*(params.metronomeSound==2?55:80)))*.13f*params.metronomeLevel;mixL+=click;mixR+=click;}const double step=params.tempo/(60.*sr);countInElapsed+=step;countInRemaining=std::max(0.,countInRemaining-step);if(countInRemaining<1e-9)countInRemaining=0;}
+        if(!isRecording)lastRecordPosition=-1;
+        if(isPlaying&&!counting){
+            if(rollHeld){const double length=std::min(rollLength,static_cast<double>(maxFrames())-rollBegin);if(length>0&&(position<rollBegin||position>=rollBegin+length))position=rollBegin+std::fmod(std::fmod(position-rollBegin,length)+length,length);}
+            if(!rollHeld && params.loop && loopFinish>loopBegin+1){
+                const double length=loopFinish-loopBegin;
+                if(position>=loopFinish || position<loopBegin){position=loopBegin+std::fmod(std::fmod(position-loopBegin,length)+length,length);}
+            }
+            if(position<0 || position>=static_cast<double>(maxFrames())){isPlaying=false;isRecording=false;position=std::clamp(position,0.0,static_cast<double>(maxFrames()-1));}
+            if(isPlaying){
+                for(size_t track=0;track<tape.size();++track){
+                    const auto& t=tape[track];if(t.mute || (anySolo&&!t.solo))continue;
+                    const float panL=t.pan>0?1-t.pan:1,panR=t.pan<0?1+t.pan:1;
+                    const float trackL=brakeHeld?0:t.audio.interpolate(0,position)*t.level*panL;
+                    const float trackR=brakeHeld?0:t.audio.interpolate(1,position)*t.level*panR;
+                    trackPeaks[track]=std::max(trackPeaks[track],std::max(std::abs(trackL),std::abs(trackR)));
+                    mixL+=trackL;mixR+=trackR;
+                    if(stems){if(stems[track*2])stems[track*2][i]=trackL;if(stems[track*2+1])stems[track*2+1][i]=trackR;}
+                }
+                if(isRecording&&!brakeHeld){
+                    auto& t=tape[static_cast<size_t>(selected)];const auto at=static_cast<size_t>(position);
+                    // Capacity was reserved in setRecording(). Never allocate in
+                    // the audio callback, even after malformed restored state.
+                    // Retain the current continuous write stroke for the LCD;
+                    // a seek/loop/chop starts a new stroke, without allocating.
+                    if(lastRecordPosition<0||std::abs(position-lastRecordPosition)>std::max(8.,std::abs((double)lastTapeRate)*2))recordStrokeBegin=recordStrokeEnd=position/sr;
+                    recordStrokeBegin=std::min(recordStrokeBegin,position/sr);recordStrokeEnd=std::max(recordStrokeEnd,(position+1)/sr);lastRecordPosition=position;
+                    const auto previous=t.audio.readStereo(at);
+                    const float recordL=std::clamp(previous[0]+synthL*params.tapeRecordLevel*(params.tapeRecordPan>0?1-params.tapeRecordPan:1),-4.0f,4.0f);
+                    const float recordR=std::clamp(previous[1]+synthR*params.tapeRecordLevel*(params.tapeRecordPan<0?1+params.tapeRecordPan:1),-4.0f,4.0f);
+                    if(!t.audio.tryWrite(at,recordL,recordR)){++tapeFailures;isRecording=false;}
+                }
+                if(params.metronome&&!brakeHeld){const double phase=metronomeBeat-std::floor(metronomeBeat);if(phase<.045){const double seconds=phase*60./params.tempo;const double frequency=params.metronomeSound==1?850:params.metronomeSound==2?1400:1900;float click=static_cast<float>(std::sin(seconds*frequency*tau)*std::exp(-seconds*(params.metronomeSound==2?55:110)))*.08f*params.metronomeLevel;mixL+=click;mixR+=click;}}
+                metronomeBeat+=params.tempo/(60.*sr);if(metronomeBeat>=4)metronomeBeat-=4;
+                if(!brakeHeld){lastTapeRate=params.tapeSpeed*std::pow(2.f,modulationRoutes[18])*(reverseHeld?-1.f:1.f);position+=lastTapeRate;tapeTravel+=lastTapeRate/sr;}
+            }
+        }
+        switch(params.tapeStyle){
+            case 1:mixL=std::tanh(mixL*1.25f)*.8f;mixR=std::tanh(mixR*1.25f)*.8f;break;
+            case 2:mixL=std::tanh(mixL*1.7f)*.65f;mixR=std::tanh(mixR*1.7f)*.65f;break;
+            case 3:mixL=std::round(mixL*8192)/8192;mixR=std::round(mixR*8192)/8192;break;
+            default:break;
+        }
+        smoothedVolume+=.001f*(clamp(params.volume*(1+modulationRoutes[19]),0,2.f)-smoothedVolume);
+        left[i]=std::clamp(mixL*smoothedVolume,-1.0f,1.0f);right[i]=std::clamp(mixR*smoothedVolume,-1.0f,1.0f);
+        if(!std::isfinite(left[i]))left[i]=0;
+        if(!std::isfinite(right[i]))right[i]=0;
+        previousOutputEnvelope=std::max(std::abs(left[i]),std::abs(right[i]));
+        peakValue=std::max(previousOutputEnvelope,peakValue*.9997f);
+    }
+    midiProcessing=false;midiFrameCursor=static_cast<int>(std::min<int64_t>(2147483647,static_cast<int64_t>(midiFrameCursor)+frames));
+}
+std::unique_ptr<Engine::PreparedSample> Engine::prepareSample(const std::vector<float>& l,const std::vector<float>& r,double rate){
+    const double safeRate=std::clamp(std::isfinite(rate)?rate:44100.0,8000.0,192000.0);
+    const size_t n=std::min(l.size(),static_cast<size_t>(safeRate*120.));
+    std::vector<float> left(n),right(n);
+    for(size_t i=0;i<n;++i){left[i]=clamp(l[i],-4,4);right[i]=r.empty()?left[i]:clamp(r[std::min(i,r.size()-1)],-4,4);}
+    return std::unique_ptr<PreparedSample>(new PreparedSample(std::move(left),std::move(right),safeRate));
+}
+Engine::PreparedSample* Engine::registerPreparedSample(std::unique_ptr<PreparedSample> sample){
+    if(!sample)return nullptr;if(!sampleRegistryIdentity)sampleRegistryIdentity=std::make_unique<unsigned char>(0);sample->registryIdentity=sampleRegistryIdentity.get();auto* result=sample.get();sampleAssets.push_back(std::move(sample));return result;
+}
+bool Engine::installPreparedSample(PreparedSample* sample)noexcept{
+    if(!sample||sample->registryIdentity!=sampleRegistryIdentity.get()||!sampleRegistryIdentity)return false;if(currentSample==sample)return true;
+    bool pending=true;if(!sample->pendingInstall.compare_exchange_strong(pending,false,std::memory_order_acq_rel))return false;
+    const PreparedSample* previous=currentSample;currentSample=sample;
+    if(previous)previous->references.fetch_sub(1,std::memory_order_release);
+    return true;
+}
+void Engine::discardPreparedSample(PreparedSample* sample)noexcept{
+    if(sample&&sampleRegistryIdentity&&sample->registryIdentity==sampleRegistryIdentity.get()&&sample->pendingInstall.exchange(false,std::memory_order_acq_rel))sample->references.fetch_sub(1,std::memory_order_release);
+}
+size_t Engine::collectRetiredSamples(){
+    const size_t before=sampleAssets.size();sampleAssets.erase(std::remove_if(sampleAssets.begin(),sampleAssets.end(),[](const auto& asset){return asset->references.load(std::memory_order_acquire)==0;}),sampleAssets.end());return before-sampleAssets.size();
+}
+void Engine::releaseVoiceSample(Voice& v)noexcept{if(v.sampleAsset){v.sampleAsset->references.fetch_sub(1,std::memory_order_release);v.sampleAsset=nullptr;}}
+const std::vector<float>& Engine::sampleLeft()const{static const std::vector<float> empty;return currentSample?currentSample->left:empty;}
+const std::vector<float>& Engine::sampleRight()const{static const std::vector<float> empty;return currentSample?currentSample->right:empty;}
+void Engine::loadSample(const std::vector<float>& l,const std::vector<float>& r,double rate){
+    allNotesOff();auto sample=prepareSample(l,r,rate);installPreparedSample(registerPreparedSample(std::move(sample)));collectRetiredSamples();
+}
+void Engine::selectTrack(int i){selected=std::clamp(i,0,3);if(isRecording){tape[selected].audio.prepareWrite(maxFrames());}}
+void Engine::setTrackLevel(int i,float v){if(i>=0&&i<4)tape[i].level=clamp(v,0,2);}
+void Engine::setTrackPan(int i,float v){if(i>=0&&i<4)tape[i].pan=clamp(v,-1,1);}
+void Engine::setTrackMute(int i,bool v){if(i>=0&&i<4)tape[i].mute=v;}
+void Engine::setTrackSolo(int i,bool v){if(i>=0&&i<4)tape[i].solo=v;}
+float Engine::trackLevel(int i)const{return tape[std::clamp(i,0,3)].level;}
+float Engine::trackPan(int i)const{return tape[std::clamp(i,0,3)].pan;}
+bool Engine::trackMute(int i)const{return tape[std::clamp(i,0,3)].mute;}
+bool Engine::trackSolo(int i)const{return tape[std::clamp(i,0,3)].solo;}
+void Engine::setPlaying(bool v){isPlaying=v;if(!v){clearSequenceGates();isRecording=false;countInRemaining=0;reverseHeld=false;brakeHeld=false;rollHeld=false;}}
+Engine::Snapshot Engine::capture(unsigned mask)const{Snapshot s;s.track=selected;s.head=position;s.mask=mask?mask&15u:1u<<selected;for(int i=0;i<4;++i)if(s.mask&(1u<<i))s.audio[i]=tape[i];return s;}
+void Engine::trimHistory(){
+    constexpr size_t limit=256u*1024u*1024u;
+    auto bytes=[](const std::deque<Snapshot>& q){size_t total=0;for(const auto& s:q)for(int i=0;i<4;++i)if(s.mask&(1u<<i))total+=snapshotBytes(s.audio[i]);return total;};
+    while(undos.size()>7){retiredTape.push_back(std::move(undos.front().audio));undos.pop_front();}
+    while(redos.size()>7){retiredTape.push_back(std::move(redos.front().audio));redos.pop_front();}
+    while(undos.size()>1 && bytes(undos)+bytes(redos)>limit){retiredTape.push_back(std::move(undos.front().audio));undos.pop_front();}
+    while(redos.size()>1 && bytes(undos)+bytes(redos)>limit){retiredTape.push_back(std::move(redos.front().audio));redos.pop_front();}
+}
+void Engine::snapshot(unsigned mask){undos.push_back(capture(mask));retireHistory(redos);trimHistory();}
+void Engine::setRecording(bool v){
+    if(v&&!isRecording){lastRecordPosition=-1;recordStrokeBegin=recordStrokeEnd=position/sr;}
+    if(v&&!isRecording){snapshot();tape[selected].audio.prepareWrite(maxFrames());isPlaying=true;countInRemaining=countInSetting;countInElapsed=0;}
+    isRecording=v;if(!v)countInRemaining=0;
+}
+void Engine::startPreparedRecording(TapeAudio&& prepared){
+    lastRecordPosition=-1;recordStrokeBegin=recordStrokeEnd=position/sr;
+    const auto required=(maxFrames()+tape::pageFrames-1)/tape::pageFrames;
+    const auto space=prepared.stats();if(space.freePages<required+1||space.freeNodes<required*3+3)throw std::runtime_error("Recording reserve is not ready");
+    snapshot();tape[selected].audio=std::move(prepared);isPlaying=true;isRecording=true;countInRemaining=countInSetting;countInElapsed=0;
+}
+void Engine::rewind(){metronomeBeat=0;sequenceFinished=false;seqTicks=0;seqBounce=1;const double old=position;position=params.loop?loopBegin:0;tapeTravel+=(position-old)/sr;seqPhase=0;seqStep=-1;seqPositionPending=-1;}
+void Engine::seek(double seconds){const double old=position;position=std::clamp(std::isfinite(seconds)?seconds:0.0,0.0,359.999)*sr;tapeTravel+=(position-old)/sr;metronomeBeat=std::fmod(position/sr*params.tempo/60.,4.);}
+void Engine::setLoop(double start,double end){start=std::isfinite(start)?start:0;end=std::isfinite(end)?end:2;loopBegin=std::clamp(start,0.0,359.999)*sr;loopFinish=std::clamp(end,loopBegin/sr+1.0/sr,360.0)*sr;}
+double Engine::recordedSeconds()const{size_t n=0;for(const auto&t:tape)n=std::max(n,t.audio.size());return n/sr;}
+void Engine::clearTrack(){snapshot();auto& t=tape[selected];t.audio=TapeAudio{};t.cuts.clear();}
+void Engine::copyTracks(unsigned mask,double start,double end){
+    mask=mask?mask&15u:1u<<selected;
+    clipboardMask=0;clipboardFrames=0;for(auto& t:clipboard)t=Track{};
+    start=std::clamp(std::isfinite(start)?start:0.,0.,360.);end=std::clamp(std::isfinite(end)?end:0.,0.,360.);
+    const size_t a=static_cast<size_t>(start*sr),b=static_cast<size_t>(end*sr);if(a>=b)return;
+    size_t last=0;for(int i=0;i<4;++i)if(mask&(1u<<i))last=std::max(last,tape[i].audio.size());
+    if(a>=std::min(b,last))return;clipboardFrames=std::min(b,last)-a;clipboardMask=mask;
+    for(int i=0;i<4;++i)if(mask&(1u<<i)){
+        const auto& t=tape[i];auto& c=clipboard[i];c.audio.resize(clipboardFrames);
+        if(a<t.audio.size()){const size_t n=std::min(clipboardFrames,t.audio.size()-a);for(size_t f=0;f<n;++f){const auto value=t.audio.readStereo(a+f);c.audio.write(f,value[0],value[1]);}}
+        c.level=t.level;c.pan=t.pan;c.mute=t.mute;c.solo=t.solo;
+        for(double cut:t.cuts)if(cut>=start&&cut<=end)c.cuts.push_back(cut-start);
+    }
+}
+void Engine::lift(double start,double end){liftTracks(1u<<selected,start,end);}
+void Engine::liftTracks(unsigned mask,double start,double end){
+    if(!std::isfinite(start)||!std::isfinite(end))return;
+    copyTracks(mask,start,end);if(!clipboardMask)return;snapshot(clipboardMask);
+    const size_t a=static_cast<size_t>(std::clamp(start,0.,360.)*sr);
+    for(int i=0;i<4;++i)if(clipboardMask&(1u<<i)){auto& t=tape[i];const size_t b=std::min(t.audio.size(),a+clipboardFrames);if(a>=b)continue;t.audio.silence(a,b);t.cuts.erase(std::remove_if(t.cuts.begin(),t.cuts.end(),[&](double c){return c>=start&&c<=end;}),t.cuts.end());}
+    position=static_cast<double>(a);
+}
+void Engine::drop(){dropTracks();}
+void Engine::dropTracks(int destination){
+    if(!clipboardMask)return;if(destination<0)destination=selected;destination=std::clamp(destination,0,3);
+    int first=0;while(!(clipboardMask&(1u<<first)))++first;
+    unsigned mask=0;for(int i=first;i<4;++i)if((clipboardMask&(1u<<i))&&destination+i-first<4)mask|=1u<<(destination+i-first);
+    snapshot(mask);const size_t a=static_cast<size_t>(std::clamp(position,0.,static_cast<double>(maxFrames()-1)));
+    for(int i=first;i<4;++i)if((clipboardMask&(1u<<i))&&destination+i-first<4){auto& t=tape[destination+i-first];const auto& c=clipboard[i];const size_t n=std::min(c.audio.size(),maxFrames()-a);
+        t.audio.resize(std::max(t.audio.size(),a+n));for(size_t f=0;f<n;++f){const auto value=c.audio.readStereo(f);t.audio.write(a+f,value[0],value[1]);}
+        t.cuts.erase(std::remove_if(t.cuts.begin(),t.cuts.end(),[&](double cut){return cut>=a/sr&&cut<=(a+n)/sr;}),t.cuts.end());
+        for(double cut:c.cuts)if(cut<=n/sr)t.cuts.push_back(cut+a/sr);t.cuts.push_back(a/sr);t.cuts.push_back((a+n)/sr);std::sort(t.cuts.begin(),t.cuts.end());t.cuts.erase(std::unique(t.cuts.begin(),t.cuts.end()),t.cuts.end());
+    }
+}
+void Engine::mergeClipboard(int destination){
+    if(!clipboardMask)return;destination=destination<0?selected:std::clamp(destination,0,3);snapshot(1u<<destination);writeClipboardMix(destination);
+}
+void Engine::writeClipboardMix(int destination){
+    auto& t=tape[destination];const size_t a=static_cast<size_t>(std::clamp(position,0.,static_cast<double>(maxFrames()-1))),n=std::min(clipboardFrames,maxFrames()-a);
+    t.audio.resize(std::max(t.audio.size(),a+n));
+    bool solo=false;for(int i=0;i<4;++i)if(clipboardMask&(1u<<i))solo|=clipboard[i].solo;
+    for(size_t f=0;f<n;++f){float l=0,r=0;for(int i=0;i<4;++i)if(clipboardMask&(1u<<i)){const auto& c=clipboard[i];if(c.mute||(solo&&!c.solo)||f>=c.audio.size())continue;l+=c.audio.read(0,f)*c.level*(c.pan>0?1-c.pan:1);r+=c.audio.read(1,f)*c.level*(c.pan<0?1+c.pan:1);}t.audio.write(a+f,std::clamp(l,-4.f,4.f),std::clamp(r,-4.f,4.f));}
+    t.cuts.push_back(a/sr);t.cuts.push_back((a+n)/sr);std::sort(t.cuts.begin(),t.cuts.end());
+}
+void Engine::joinTracks(unsigned mask,double start,double end){
+    mask=mask?mask&15u:1u<<selected;
+    if(!std::isfinite(start)||!std::isfinite(end)||start>=end||!(mask&15u))return;snapshot(mask&15u);
+    for(int i=0;i<4;++i)if(mask&(1u<<i)){auto& c=tape[i].cuts;c.erase(std::remove_if(c.begin(),c.end(),[&](double cut){return cut>start&&cut<end;}),c.end());}
+}
+void Engine::slideTracks(unsigned mask,double start,double end,double delta){
+    mask=mask?mask&15u:1u<<selected;
+    if(!std::isfinite(start)||!std::isfinite(end)||!std::isfinite(delta)||start>=end||delta==0||!(mask&15u))return;
+    start=std::clamp(start,0.,360.);end=std::clamp(end,0.,360.);delta=std::clamp(delta,-start,360.-end);if(delta==0)return;
+    const size_t a=static_cast<size_t>(start*sr),b=static_cast<size_t>(end*sr),at=static_cast<size_t>((start+delta)*sr);if(a>=b)return;snapshot(mask&15u);
+    for(int i=0;i<4;++i)if(mask&(1u<<i)){auto& t=tape[i];if(a>=t.audio.size())continue;const size_t finish=std::min(b,t.audio.size()),n=finish-a;
+        const auto source=t.audio;std::vector<double> cuts;for(double cut:t.cuts)if(cut>=start&&cut<=end)cuts.push_back(cut+delta);
+        t.audio.silence(a,finish);t.audio.resize(std::max(t.audio.size(),at+n));for(size_t f=0;f<n;++f){const auto value=source.readStereo(a+f);t.audio.write(at+f,value[0],value[1]);}
+        t.cuts.erase(std::remove_if(t.cuts.begin(),t.cuts.end(),[&](double cut){return (cut>=start&&cut<=end)||(cut>=at/sr&&cut<=(at+n)/sr);}),t.cuts.end());t.cuts.insert(t.cuts.end(),cuts.begin(),cuts.end());t.cuts.push_back(at/sr);t.cuts.push_back((at+n)/sr);std::sort(t.cuts.begin(),t.cuts.end());}
+}
+void Engine::bounceTracks(unsigned mask,int destination,double start,double end,bool clearSources){
+    mask=mask?mask&15u:1u<<selected;
+    if(!(mask&15u)||destination<0||destination>3||!std::isfinite(start)||!std::isfinite(end)||start>=end)return;
+    // Reuse the bounded control-thread clipboard renderer, preserving the user's clipboard/history.
+    auto saved=std::move(clipboard);const auto savedMask=clipboardMask;const auto savedFrames=clipboardFrames;const double head=position;
+    copyTracks(mask,start,end);if(clipboardMask){snapshot((clearSources?mask:0)|(1u<<destination));position=std::clamp(start,0.,360.)*sr;
+        writeClipboardMix(destination);
+        if(clearSources)for(int i=0;i<4;++i)if(i!=destination&&(mask&(1u<<i))){auto& t=tape[i];const size_t a=std::min(t.audio.size(),static_cast<size_t>(std::clamp(start,0.,360.)*sr)),b=std::min(t.audio.size(),static_cast<size_t>(std::clamp(end,0.,360.)*sr));t.audio.silence(a,b);t.cuts.erase(std::remove_if(t.cuts.begin(),t.cuts.end(),[&](double c){return c>=start&&c<=end;}),t.cuts.end());}
+    }clipboard=std::move(saved);clipboardMask=savedMask;clipboardFrames=savedFrames;position=head;
+}
+void Engine::setTapeRoll(bool held,float beats){if(held&&!rollHeld){rollBegin=position;rollLength=std::max(1.,sr*60./params.tempo*clamp(beats,.03125f,8.f));}rollHeld=held;}
+void Engine::split(){snapshot();auto& cuts=tape[selected].cuts;cuts.push_back(position/sr);std::sort(cuts.begin(),cuts.end());cuts.erase(std::unique(cuts.begin(),cuts.end()),cuts.end());}
+void Engine::restore(Snapshot&& s){selected=s.track;for(int i=0;i<4;++i)if(s.mask&(1u<<i))tape[i]=std::move(s.audio[i]);position=s.head;isRecording=false;isPlaying=false;countInRemaining=0;reverseHeld=false;brakeHeld=false;rollHeld=false;}
+void Engine::undo(){if(undos.empty())return;selected=undos.back().track;redos.push_back(capture(undos.back().mask));auto s=std::move(undos.back());undos.pop_back();restore(std::move(s));trimHistory();}
+void Engine::redo(){if(redos.empty())return;selected=redos.back().track;undos.push_back(capture(redos.back().mask));auto s=std::move(redos.back());redos.pop_back();restore(std::move(s));trimHistory();}
+std::vector<float> Engine::waveform(int track,int bins)const{if(track<0||track>=4)return std::vector<float>((size_t)std::max(0,bins),0);return waveform(tape[(size_t)track].audio,bins);}
+std::vector<float> Engine::waveform(const TapeAudio& audio,int bins){
+    std::vector<float> result(static_cast<size_t>(std::max(0,bins)),0);if(bins<=0)return result;
+    if(audio.empty())return result;
+    // Display-only decimation: at most 32 samples per bin, independent of
+    // tape duration. This is a waveform overview, not a true-peak analyser.
+    for(int b=0;b<bins;++b){
+        size_t a=static_cast<size_t>(static_cast<double>(b)/bins*audio.size());
+        size_t e=std::min(audio.size(),std::max(a+1,static_cast<size_t>(static_cast<double>(b+1)/bins*audio.size())));
+        size_t count=std::min<size_t>(32,e-a);float v=0;
+        for(size_t j=0;j<count;++j){size_t i=a+(e-a-1)*j/std::max<size_t>(1,count-1);v=std::max(v,std::max(std::abs(audio.read(0,i)),std::abs(audio.read(1,i))));}
+        result[static_cast<size_t>(b)]=v;
+    }
+    return result;
+}
+std::pair<std::vector<float>,std::vector<float>> Engine::exportMix()const{return exportMix(tape,params);}
+std::pair<std::vector<float>,std::vector<float>> Engine::exportMix(const std::array<Track,4>& tape,const Parameters& params){
+    size_t n=0;for(const auto&t:tape)n=std::max(n,t.audio.size());std::pair<std::vector<float>,std::vector<float>> out{std::vector<float>(n,0),std::vector<float>(n,0)};
+    bool solo=std::any_of(tape.begin(),tape.end(),[](const Track&t){return t.solo;});
+    for(const auto&t:tape){if(t.mute||(solo&&!t.solo))continue;float l=t.level*(t.pan>0?1-t.pan:1),r=t.level*(t.pan<0?1+t.pan:1);for(size_t i=0;i<t.audio.size();++i){out.first[i]+=t.audio.read(0,i)*l;out.second[i]+=t.audio.read(1,i)*r;}}
+    for(size_t i=0;i<n;++i){
+        auto colour=[&](float v){
+            switch(params.tapeStyle){case 1:return std::tanh(v*1.25f)*.8f;case 2:return std::tanh(v*1.7f)*.65f;case 3:return std::round(v*8192)/8192;default:return v;}
+        };
+        out.first[i]=std::clamp(colour(out.first[i])*params.volume,-1.0f,1.0f);
+        out.second[i]=std::clamp(colour(out.second[i])*params.volume,-1.0f,1.0f);
+    }return out;
+}
+void Engine::restoredTape(){
+    for(auto& t:tape){const size_t n=std::min(t.audio.size(),maxFrames());t.audio.resize(n);for(size_t i=0;i<n;++i){const auto value=t.audio.readStereo(i);const float l=clamp(value[0],-4,4),r=clamp(value[1],-4,4);if(l!=value[0]||r!=value[1])t.audio.write(i,l,r);}t.level=clamp(t.level,0,2);t.pan=clamp(t.pan,-1,1);}
+    tapeBankChanged();
+}
+void Engine::tapeBankChanged(){
+    retireHistory(undos);retireHistory(redos);isPlaying=false;isRecording=false;countInRemaining=0;countInElapsed=0;reverseHeld=false;brakeHeld=false;rollHeld=false;position=std::clamp(position,0.0,static_cast<double>(maxFrames()-1));
+}
+void Engine::setSequenceStep(int step,int note,float velocity){if(step>=0&&step<999){steps[step]=std::clamp(note,-1,127);stepVelocity[step]=clamp(velocity);stepChords[(size_t)step].reset();if(note>=0)stepChords[(size_t)step].set((size_t)std::min(note,127));}}
+void Engine::setSequenceNote(int step,int note,bool enabled){if(step<0||step>=999||note<0||note>127)return;auto& chord=stepChords[(size_t)step];if(enabled&&chord.count()>=8&&!chord[(size_t)note])return;chord.set((size_t)note,enabled);steps[(size_t)step]=-1;for(int n=0;n<128;++n)if(chord[(size_t)n]){steps[(size_t)step]=n;break;}}
+int Engine::sequenceStep(int step)const{return step>=0&&step<999?steps[step]:-1;}
+float Engine::sequenceVelocity(int step)const{return step>=0&&step<999?stepVelocity[step]:0;}
+void Engine::setSongPosition(int sixteenthNotes){
+    sequenceFinished=false;seqTicks=0;seqBounce=1;
+    const int length=params.sequencer==3?32:seqLength;
+    seqStep=std::clamp(sixteenthNotes,0,16383)%length;
+    seqPositionPending=seqStep;seqPhase=0;seqLastNote=-1;
+    clearSequenceGates();
+}
+void Engine::setSequenceLength(int count){seqLength=std::clamp(count,1,999);if(seqStep>=seqLength){seqStep=-1;seqPositionPending=-1;seqPhase=0;}}
+void Engine::clearHeldNotes(){allNotesOff();}
+void Engine::setSketchPoint(int index,float x,float y){if(index>=0&&index<256)sketch[static_cast<size_t>(index)]={clamp(x),clamp(y)};}
+std::pair<float,float> Engine::sketchPoint(int index)const{const auto& p=sketch[static_cast<size_t>(std::clamp(index,0,255))];return {p.x,p.y};}
+void Engine::setSketchLength(int length){sketchCount=std::clamp(length,2,256);}
+void Engine::setTombolaBall(int index,const BallState& source){
+    if(index<0||index>=24)return;
+    auto b=source;b.x=clamp(b.x,.018f,.982f);b.y=clamp(b.y,.018f,.982f);b.vx=clamp(b.vx,-8,8);b.vy=clamp(b.vy,-8,8);b.note=std::clamp(b.note,0,127);balls[static_cast<size_t>(index)]=b;ballVelocity[static_cast<size_t>(index)]=.8f;ballCooldown[static_cast<size_t>(index)]=0;
+}
+void Engine::setTombolaRotation(float radians){ballAngle=std::isfinite(radians)?std::remainder(radians,static_cast<float>(tau)):0;}
+void Engine::setFingerPattern(int pattern){fingerSelected=std::clamp(pattern,0,15);}
+void Engine::setFingerStep(int pattern,int step,int note,float velocity){if(pattern>=0&&pattern<16&&step>=0&&step<32){auto& chord=fingerBanks[(size_t)pattern].chords[(size_t)step];chord.reset();if(note>=0)chord.set((size_t)std::min(note,127));fingerBanks[static_cast<size_t>(pattern)].note[static_cast<size_t>(step)]=std::clamp(note,-1,127);fingerBanks[static_cast<size_t>(pattern)].velocity[static_cast<size_t>(step)]=clamp(velocity);}}
+void Engine::setFingerNote(int bank,int step,int note,bool enabled){if(bank<0||bank>15||step<0||step>31||note<0||note>127)return;auto& b=fingerBanks[(size_t)bank];auto& chord=b.chords[(size_t)step];if(enabled&&chord.count()>=8&&!chord[(size_t)note])return;chord.set((size_t)note,enabled);b.note[(size_t)step]=-1;for(int n=0;n<128;++n)if(chord[(size_t)n]){b.note[(size_t)step]=n;break;}}
+int Engine::fingerStep(int pattern,int step)const{return pattern>=0&&pattern<16&&step>=0&&step<32?fingerBanks[static_cast<size_t>(pattern)].note[static_cast<size_t>(step)]:-1;}
+float Engine::fingerVelocity(int pattern,int step)const{return pattern>=0&&pattern<16&&step>=0&&step<32?fingerBanks[static_cast<size_t>(pattern)].velocity[static_cast<size_t>(step)]:0;}
+void Engine::setFingerLength(int pattern,int length){if(pattern>=0&&pattern<16)fingerBanks[static_cast<size_t>(pattern)].length=std::clamp(length,1,32);}
+int Engine::fingerLength(int pattern)const{return fingerBanks[static_cast<size_t>(std::clamp(pattern,0,15))].length;}
+void Engine::setPitchBend(float value){pitchBend=clamp(std::isfinite(value)?value:0,-48,48);}
+float Engine::voiceRoute(int target,float velocity) const {
+    if(!params.lfoEnabled)return 0;
+    if(params.lfo==5)return params.lfoTarget==target?(velocity*2-1)*params.lfoDepth:0;
+    return modulationRoutes[static_cast<size_t>(target)];
+}
+void Engine::setMidiCC(int cc,float value){if(cc>=1&&cc<=4){midiControllerSeen[static_cast<size_t>(cc-1)]=true;midiControllers[static_cast<size_t>(cc-1)]=clamp(value);if(cc==1)modWheel=clamp(value);}}
+void Engine::setModWheel(float value){setMidiCC(1,value);}
+void Engine::setOutputGainImmediately(float value){smoothedVolume=clamp(value,0,2.f);}
+}
+
+namespace field {
+void Engine::collectTapeStorage(size_t budget){for(auto& track:tape)track.audio.collect(budget);for(auto& track:clipboard)track.audio.collect(budget);for(auto& version:undos)for(auto& track:version.audio)track.audio.collect(budget);for(auto& version:redos)for(auto& track:version.audio)track.audio.collect(budget);}
+}
+
+namespace field {
+void Engine::retireHistory(std::deque<Snapshot>& history){while(!history.empty()){retiredTape.push_back(std::move(history.front().audio));history.pop_front();}}
+TapeEditState Engine::captureTapeEdit() const {TapeEditState state;state.tracks=tape;state.clipboard=clipboard;state.clipboardMask=clipboardMask;state.clipboardFrames=clipboardFrames;state.selected=selected;state.position=position;state.sampleRate=sr;state.parameters=params;return state;}
+TapeEditState Engine::prepareTapeEdit(const TapeEditState& base,TapeEditAction action,unsigned mask,double start,double end,double delta){
+    Engine edit;edit.sr=base.sampleRate;edit.params=base.parameters;edit.tape=base.tracks;edit.clipboard=base.clipboard;edit.clipboardMask=base.clipboardMask;edit.clipboardFrames=base.clipboardFrames;edit.selected=base.selected;edit.position=base.position;
+    mask=mask?mask&15u:1u<<base.selected;unsigned changed=mask;
+    if(action==TapeEditAction::copy)changed=0;
+    else if(action==TapeEditAction::merge||action==TapeEditAction::bounce||action==TapeEditAction::clear||action==TapeEditAction::split)changed=1u<<base.selected;
+    else if(action==TapeEditAction::drop){changed=0;if(base.clipboardMask){int first=0;while(!(base.clipboardMask&(1u<<first)))++first;for(int i=first;i<4;++i)if((base.clipboardMask&(1u<<i))&&base.selected+i-first<4)changed|=1u<<(base.selected+i-first);}}
+    if(action!=TapeEditAction::join&&action!=TapeEditAction::split&&action!=TapeEditAction::clear)for(int i=0;i<4;++i)if(changed&(1u<<i))edit.tape[i].audio=base.tracks[i].audio.preparedCopy(base.tracks[i].audio.size());
+    switch(action){case TapeEditAction::copy:edit.copyTracks(mask,start,end);break;case TapeEditAction::lift:edit.liftTracks(mask,start,end);break;case TapeEditAction::drop:edit.dropTracks();break;case TapeEditAction::merge:edit.mergeClipboard();break;case TapeEditAction::join:edit.joinTracks(mask,start,end);break;case TapeEditAction::slide:edit.slideTracks(mask,start,end,delta);break;case TapeEditAction::bounce:edit.bounceTracks(mask,base.selected,start,end,false);break;case TapeEditAction::clear:edit.clearTrack();break;case TapeEditAction::split:edit.split();break;}
+    auto result=edit.captureTapeEdit();if(action==TapeEditAction::lift&&!result.clipboardMask)changed=0;if(action==TapeEditAction::merge&&!base.clipboardMask)changed=0;result.changedMask=changed;result.updatesClipboard=action==TapeEditAction::copy||action==TapeEditAction::lift;return result;
+}
+bool Engine::commitTapeEdit(const TapeEditState& base,TapeEditState&& result){
+    if(sr!=base.sampleRate||selected!=base.selected)return false;
+    for(int i=0;i<4;++i){const auto& live=tape[i];const auto& old=base.tracks[i];if(!live.audio.sameGeneration(old.audio)||live.cuts!=old.cuts||live.level!=old.level||live.pan!=old.pan||live.mute!=old.mute||live.solo!=old.solo)return false;}
+    if(result.changedMask)snapshot(result.changedMask);
+    for(int i=0;i<4;++i)if(result.changedMask&(1u<<i)){tape[i].audio=std::move(result.tracks[i].audio);tape[i].cuts.swap(result.tracks[i].cuts);}
+    if(result.updatesClipboard){clipboard=std::move(result.clipboard);clipboardMask=result.clipboardMask;clipboardFrames=result.clipboardFrames;}
+    // Copy/lift historically move the head; other edits preserve a moving live head.
+    if(result.updatesClipboard&&result.changedMask)position=result.position;
+    return true;
+}
+}

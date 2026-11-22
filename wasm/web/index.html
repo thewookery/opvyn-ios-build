@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OPVYN — wasm</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="OPVYN">
+<meta name="theme-color" content="#0a0c10">
+<link rel="icon" href="data:,">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand">OPVYN<span>WASM</span></div>
+    <div id="status">loading</div>
+  </header>
+
+  <div id="engineRow" class="chips"></div>
+
+  <div id="screen"><canvas id="scope" width="640" height="180"></canvas></div>
+
+  <div id="knobs"></div>
+
+  <div id="env" class="row"></div>
+
+  <div class="row two">
+    <div id="fxChips" class="chips small"></div>
+    <div id="mixWrap"><label>FX MIX</label><input id="mix" type="range" min="0" max="1" step="0.01" value="0.25"></div>
+  </div>
+
+  <div id="transport">
+    <button id="rew">◀◀</button>
+    <button id="play">▶</button>
+    <button id="stop">■</button>
+    <button id="rec">●</button>
+    <button id="ff">▶▶</button>
+    <button id="loop">LOOP</button>
+    <span id="pos">0:00.0</span>
+  </div>
+
+  <div id="tracks">
+    <button data-t="0">T1</button><button data-t="1">T2</button>
+    <button data-t="2">T3</button><button data-t="3">T4</button>
+    <button id="drum">DRUM</button>
+  </div>
+
+  <div id="keyboard"></div>
+
+  <div id="foot">
+    <button id="panic">PANIC</button>
+    <div id="voiceCount">0 voices</div>
+  </div>
+</div>
+
+<div id="overlay">
+  <div class="ov">
+    <div class="logo">OPVYN<span>WASM</span></div>
+    <div class="sub">OPVYN ENGINE · 15 ENGINES · 11 EFFECTS</div>
+    <button id="start">TAP TO START</button>
+    <div id="ovErr"></div>
+    <div class="fine">Engine compiled from OPVYN (MIT). Audio runs locally in WebAssembly.</div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

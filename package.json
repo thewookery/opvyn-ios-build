@@ -1,0 +1,31 @@
+{
+  "name": "opvyn",
+  "version": "1.0.0",
+  "description": "An open-source synthesizer, sampler and four-track stereo tape instrument inspired by the Teenage Engineering OP–1 field workflow. Builds a standalone application and VST3 from the same C++ audio engine; macOS also builds AU.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stevenmcsorley/opvyn.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/stevenmcsorley/opvyn/issues"
+  },
+  "homepage": "https://github.com/stevenmcsorley/opvyn#readme",
+  "dependencies": {
+    "puppeteer-core": "^23.11.1"
+  },
+  "devDependencies": {
+    "playwright": "^1.65.1"
+  }
+}

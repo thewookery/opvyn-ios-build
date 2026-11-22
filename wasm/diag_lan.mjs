@@ -1,0 +1,15 @@
+﻿import puppeteer from 'puppeteer-core';
+const browser = await puppeteer.launch({ executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: 'new', args: ['--autoplay-policy=no-user-gesture-required','--mute-audio'] });
+const page = await browser.newPage();
+const msgs=[];
+page.on('pageerror',e=>msgs.push('PAGEERROR '+e.message));
+page.on('console',m=>msgs.push(m.type()+' '+m.text()));
+page.on('requestfailed',r=>msgs.push('REQFAIL '+r.url()+' '+r.failure()?.errorText));
+await page.setViewport({width:390,height:844,deviceScaleFactor:2,isMobile:true,hasTouch:true});
+await page.goto('http://192.168.0.43:8790/', {waitUntil:'networkidle0', timeout:20000});
+console.log('loaded', await page.title());
+await page.click('#start');
+await new Promise(r=>setTimeout(r,8000));
+const st = await page.evaluate(()=>({status:document.querySelector('#status').textContent, field:!!window.__opvyn, ctx:window.__opvyn?.ctx?.state, res:performance.getEntriesByType('resource').map(r=>r.name.split('/').pop())}));
+console.log(JSON.stringify({st,msgs},null,1));
+await browser.close();
