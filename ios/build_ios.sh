@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # Build the real OPVYN JUCE panel as an iOS app (unsigned .ipa).
 # Requires macOS + Xcode 15+ (or run via .github/workflows/ios.yml).
 set -euo pipefail
@@ -18,7 +18,7 @@ cmake -B "$BUILD" -G Xcode \
 cmake --build "$BUILD" --config Release --target FieldStudio_Standalone -- \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
-APP="$(find "$BUILD" -name '*.app' -type d -path '*Release-iphoneos*' | head -1)"
+APP="$(find "$BUILD" -name 'OPVYN.app' -type d | head -1)"
 [ -n "$APP" ] || { echo "no .app produced" >&2; exit 1; }
 echo "app: $APP"
 
@@ -40,3 +40,4 @@ zip -qry OPVYN-unsigned.ipa Payload
 rm -rf Payload
 
 echo "wrote $(pwd)/OPVYN-unsigned.ipa"
+
