@@ -127,6 +127,12 @@ private:
     double tapeTravel=0,tapePosition=0,tapeWriteBegin=0,tapeWriteEnd=0,tapeViewStart=-8;float tapeTransportSpeed=0;
     double recorded=0,visibleSeconds=16;
     float scale=1;
+    float uiScale=1,uiX=0,uiY=0;
+#if JUCE_IOS
+    juce::TextButton uiToggle{"UI"};
+#endif
+    bool compact=false;
+    juce::Rectangle<int> uiRect(int,int,int,int) const;
     field::CwoAnimation insertCwoMotion,masterCwoMotion;
     double effectAnimationTime=0;
     bool observedMediaJob=false;
@@ -153,6 +159,7 @@ private:
     int noteAt(juce::Point<float>) const;
     juce::Point<float> localPoint(juce::Point<float>) const;
     juce::Rectangle<int> boundsFor(float,float,float,float) const;
+    juce::Rectangle<int> compBoundsFor(float,float,float,float) const;
     void drawCap(juce::Graphics&,juce::Rectangle<float>,bool,bool=false);
     void drawScreen(juce::Graphics&);
     void drawEngine(juce::Graphics&,juce::Rectangle<float>);

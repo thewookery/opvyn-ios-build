@@ -142,7 +142,10 @@ field::UiTelemetry FieldProcessor::makeUiTelemetry(bool render) const {
  return s;
 }
 void FieldProcessor::updateEngine(){if((int)cached(P_engine)==14)drumMode=true;auto& target=renderingOwner==this?renderingEngine():engine;target.setParameters(currentParameters());target.setCountInBeats((int)cached(P_countInBeats));}
-void FieldProcessor::prepareToPlay(double sr,int block){invalidateLiveControls();mediaJobs.cancel();const std::lock_guard<std::mutex> deviceGuard(captureDeviceMutex);callbackRate=sr>0?sr:44100;preparedRate=callbackRate;const juce::ScopedLock lock(engineLock);if(std::abs(engine.sampleRate()-sr)>.5){externalCapture.stop();externalSourceName="Device / DAW input";}++documentEpoch;++sampleRequest;++controlRevision;
+void FieldProcessor::prepareToPlay(double sr,int block){invalidateLiveControls();mediaJobs.cancel();
+#if JUCE_IOS
+    {static bool installed=false;if(!installed){installed=true;installLaunchkeyDefaults();}}
+#endifconst std::lock_guard<std::mutex> deviceGuard(captureDeviceMutex);callbackRate=sr>0?sr:44100;preparedRate=callbackRate;const juce::ScopedLock lock(engineLock);if(std::abs(engine.sampleRate()-sr)>.5){externalCapture.stop();externalSourceName="Device / DAW input";}++documentEpoch;++sampleRequest;++controlRevision;
     if(!offlineFixture&&ownershipReady){acknowledgeDocument();installPreparedCommit();acknowledgeDocument();pollDocuments();fillDocumentSnapshot(lastDocumentSnapshot);applyModel(lastDocumentSnapshot);}
     double old=engine.sampleRate();albumRecording=-1;albumPlaying=-1;documentAlbumRecording=-1;documentAlbumPlaying=-1;engine.prepare(sr,block);masterFx.prepare(sr,block);masterFx.setOutputGainImmediately(1);masterState={};sampling=false;documentSampling=false;captureArmed=false;captureAutoStop=false;captureAudio=field::TapeAudio{};captureExhausted=false;
     if(old!=sr)for(auto& bank:tapes)for(auto& t:bank.tracks)t.audio.resample(sr/old,(size_t)(sr*360));
@@ -153,6 +156,18 @@ bool FieldProcessor::isBusesLayoutSupported(const BusesLayout& l) const {if(l.ge
 void FieldProcessor::retainSkippedReleases(const juce::MidiBuffer& midi)noexcept{int inspected=0;for(const auto event:midi){if(++inspected>2048){missedReleaseOverflow=true;break;}if(event.numBytes!=3)continue;const auto* data=event.data;const auto kind=data[0]&0xf0;const bool release=kind==0x80||(kind==0x90&&data[2]==0)||(kind==0xb0&&((data[1]==64&&data[2]<64)||data[1]==120||data[1]==123));if(release&&!missedReleases.push({data[0],data[1],data[2]}))missedReleaseOverflow=true;}}
 void FieldProcessor::processBlock(juce::AudioBuffer<float>& buffer,juce::MidiBuffer& midi) {
     juce::ScopedNoDenormals noDenormals;
+#if JUCE_IOS
+    if(!midi.isEmpty()){
+        juce::MidiBuffer remapped;
+        for(const auto meta:midi){
+            auto m=meta.getMessage();
+            if(m.isNoteOnOrOff()){const int n=m.getNoteNumber();if(n>=96&&n<=119)m.setNoteNumber(n-43);}
+            remapped.addEvent(m,meta.samplePosition);
+        }
+        midi.swapWith(remapped);
+        midiSeen.fetch_add(1,std::memory_order_relaxed);
+    }
+#endif
     struct RenderScope{const FieldProcessor*& slot;const FieldProcessor* previous;RenderScope(const FieldProcessor*& s,const FieldProcessor* p):slot(s),previous(s){slot=p;}~RenderScope(){slot=previous;}} renderingScope{renderingOwner,this};
     struct Measure {FieldProcessor& p;double start=juce::Time::getMillisecondCounterHiRes();int frames;~Measure(){if(frames<=0)return;float load=(float)((juce::Time::getMillisecondCounterHiRes()-start)*.001/(frames/p.callbackRate));p.callbackLoad.store(p.callbackLoad.load(std::memory_order_relaxed)*.98f+load*.02f,std::memory_order_relaxed);p.callbackPeak.store(std::max(load,p.callbackPeak.load(std::memory_order_relaxed)),std::memory_order_relaxed);if(load>1)++p.callbackOverruns;p.actualBlockSize=frames;}} measure{*this,juce::Time::getMillisecondCounterHiRes(),buffer.getNumSamples()};
     if(buffer.getNumSamples()<=0){retainSkippedReleases(midi);midi.clear();return;}

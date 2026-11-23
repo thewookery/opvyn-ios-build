@@ -7,6 +7,14 @@ const float dboxLow[]{0,0,.005f,0,0,0,.005f,0,.0002f,0,.005f,0};
 const float dboxHigh[]{1,1,4,1,1,1,4,1,1,2,4,1};
 std::array<float*,12> dboxFields(field::DBoxPad& p){return {&p.mix,&p.wave1,&p.envelope1,&p.crossMod,&p.frequency,&p.wave2,&p.envelope2,&p.cutoff,&p.attack,&p.gain,&p.release,&p.smooth};}
 }
+void FieldProcessor::installLaunchkeyDefaults(){
+    juce::ValueTree root("MIDI_MAPPINGS");root.setProperty("version",1,nullptr);
+    auto add=[&](const char* target,int cc){juce::ValueTree b("BINDING");b.setProperty("target",target,nullptr);b.setProperty("channel",0,nullptr);b.setProperty("cc",cc,nullptr);b.setProperty("mode",0,nullptr);b.setProperty("pickup",false,nullptr);b.setProperty("invert",false,nullptr);root.addChild(b,-1,nullptr);};
+    add("macro1",21);add("macro2",22);add("macro3",23);add("macro4",24);
+    add("effectMix",25);add("volume",26);add("tempo",27);add("tapeSpeed",28);
+    add("tapePlay",115);add("tapeStop",116);add("tapeRecord",117);
+    juce::String error;restoreMidiMappingState(root,error);
+}
 int FieldProcessor::midiMappingIndex(const juce::String& id) const {for(int i=0;i<P_count;++i)if(parameterIds[(size_t)i]==id)return i;for(size_t i=0;i<extraMidiTargets;++i)if(id==extraIds[i])return P_count+(int)i;return -1;}
 juce::StringArray FieldProcessor::midiMappingTargets() const {juce::StringArray ids;for(auto& id:parameterIds)ids.add(id);for(auto id:extraIds)ids.add(id);return ids;}
 juce::String FieldProcessor::midiMappingLabel(const juce::String& id) const {int target=midiMappingIndex(id);return target<0?juce::String{}:target<P_count?rawTargets[(size_t)target]->getName(80):juce::String(extraLabels[target-P_count]);}

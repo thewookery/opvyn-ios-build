@@ -179,6 +179,8 @@ private:
     field::RealtimeValues<P_count> realtimeValues;
     static constexpr size_t extraMidiTargets=72;
     field::MidiLearn<P_count+extraMidiTargets> midiLearn;
+    std::atomic<uint32_t> midiSeen{0};
+    void installLaunchkeyDefaults();
     bool parseMidiMappings(const juce::ValueTree&,std::array<field::MidiBinding,P_count+extraMidiTargets>&,juce::String&) const;
     int midiMappingIndex(const juce::String&) const;
     float mappedMidiValue(size_t) const noexcept;
