@@ -1,4 +1,4 @@
-#include "PluginProcessor.h"
+﻿#include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "DelayControls.h"
 #include "LfoControls.h"
@@ -145,7 +145,8 @@ void FieldProcessor::updateEngine(){if((int)cached(P_engine)==14)drumMode=true;a
 void FieldProcessor::prepareToPlay(double sr,int block){invalidateLiveControls();mediaJobs.cancel();
 #if JUCE_IOS
     {static bool installed=false;if(!installed){installed=true;installLaunchkeyDefaults();}}
-#endifconst std::lock_guard<std::mutex> deviceGuard(captureDeviceMutex);callbackRate=sr>0?sr:44100;preparedRate=callbackRate;const juce::ScopedLock lock(engineLock);if(std::abs(engine.sampleRate()-sr)>.5){externalCapture.stop();externalSourceName="Device / DAW input";}++documentEpoch;++sampleRequest;++controlRevision;
+#endif
+    const std::lock_guard<std::mutex> deviceGuard(captureDeviceMutex);callbackRate=sr>0?sr:44100;preparedRate=callbackRate;const juce::ScopedLock lock(engineLock);if(std::abs(engine.sampleRate()-sr)>.5){externalCapture.stop();externalSourceName="Device / DAW input";}++documentEpoch;++sampleRequest;++controlRevision;
     if(!offlineFixture&&ownershipReady){acknowledgeDocument();installPreparedCommit();acknowledgeDocument();pollDocuments();fillDocumentSnapshot(lastDocumentSnapshot);applyModel(lastDocumentSnapshot);}
     double old=engine.sampleRate();albumRecording=-1;albumPlaying=-1;documentAlbumRecording=-1;documentAlbumPlaying=-1;engine.prepare(sr,block);masterFx.prepare(sr,block);masterFx.setOutputGainImmediately(1);masterState={};sampling=false;documentSampling=false;captureArmed=false;captureAutoStop=false;captureAudio=field::TapeAudio{};captureExhausted=false;
     if(old!=sr)for(auto& bank:tapes)for(auto& t:bank.tracks)t.audio.resample(sr/old,(size_t)(sr*360));
@@ -704,3 +705,4 @@ bool FieldProcessor::saveProject(const juce::File& file,juce::String& error){try
 
 bool FieldProcessor::loadProject(const juce::File& file,juce::String& error){if(file.getSize()>512ll*1024*1024){error="Project exceeds the 512 MB import limit.";return false;}juce::FileInputStream input(file);if(!input.openedOk()){error="Could not open project.";return false;}try{auto state=readCompressedState(input);state.setProperty("name",file.getFileNameWithoutExtension(),nullptr);restoreState(state);return true;}catch(const std::exception& e){error=e.what();return false;}}
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter(){return new FieldProcessor();}
+
